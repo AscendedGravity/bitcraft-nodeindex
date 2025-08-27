@@ -115,7 +115,13 @@ impl AppConfig {
             ]);
         }
 
-        sub.push_group(String::from("enemies: "));
+        if !self.enemies.is_empty() {
+            sub.push_group(String::from("enemies: "));
+            sub.push_query(move || vec![
+                String::from("SELECT mob.* FROM enemy_state mob JOIN mobile_entity_state loc ON mob.entity_id = loc.entity_id;"),
+                String::from("SELECT loc.* FROM mobile_entity_state loc JOIN enemy_state mob ON loc.entity_id = mob.entity_id;"),
+            ]);
+        }
         for Entity { id, name: _, properties } in self.enemies {
             state.enemy.insert(id, EntityGroup { 
                 nodes: RwLock::new(IntMap::new()), 
@@ -123,10 +129,6 @@ impl AppConfig {
                 properties 
             });
         }
-        sub.push_query(move || vec![
-            String::from("SELECT mob.* FROM enemy_state mob JOIN mobile_entity_state loc ON mob.entity_id = loc.entity_id;"),
-            String::from("SELECT loc.* FROM mobile_entity_state loc JOIN enemy_state mob ON loc.entity_id = mob.entity_id;"),
-        ]);
 
         sub.push_group(String::from("players: "));
         for Entity { id, name: _, properties } in self.players {
