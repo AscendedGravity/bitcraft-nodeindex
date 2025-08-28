@@ -21,6 +21,7 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, mpsc::{unbounded_channel, UnboundedReceiver}, broadcast};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt as _};
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use futures_util::stream::Stream;
@@ -44,7 +45,7 @@ enum Message {
     PlayerNameUpdate { id: u64, username: String },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct SseEvent {
     message: String,
 }
@@ -52,7 +53,6 @@ struct SseEvent {
 struct AppStateWithSse {
     app_state: Arc<AppState>,
     sse_tx: broadcast::Sender<SseEvent>,
-    signed_in_players: Arc<TokioRwLock<HashSet<u64>>>,
 }
 
 impl Message {
@@ -110,11 +110,9 @@ async fn main() {
 
     // Create SSE broadcast channel
     let (sse_tx, _) = broadcast::channel(1000);
-    let signed_in_players = Arc::new(TokioRwLock::new(HashSet::new()));
     let app_state_with_sse = AppStateWithSse {
         app_state: state.clone(),
         sse_tx: sse_tx.clone(),
-        signed_in_players: signed_in_players.clone(),
     };
 
     let (tx, rx) = unbounded_channel();
@@ -145,6 +143,20 @@ async fn main() {
     con.db.enemy_state().on_delete_send(&tx, |_, row|
         Some(Message::enemy_delete(row))
     );
+
+    // When a mobile entity is deleted, determine whether it was an enemy or a player
+    con.db.mobile_entity_state().on_delete_send(&tx, |ctx, row| {
+        if let Some(mob) = ctx.db.enemy_state().entity_id().find(&row.entity_id) {
+            // Deleted entity was an enemy
+            Some(Message::enemy_delete(&mob))
+        } else if ctx.db.signed_in_player_state().entity_id().find(&row.entity_id).is_some() {
+            // Only emit PlayerDelete if this entity was a signed-in player
+            Some(Message::player_delete(row.entity_id))
+        } else {
+            // Not an enemy nor a signed-in player — ignore
+            None
+        }
+    });
 
     // Player event handlers - track signed-in players using message passing
     con.db.signed_in_player_state().on_insert_send(&tx, |ctx, row| {
@@ -200,76 +212,96 @@ async fn main() {
     let (tx_sig, rx_sig) = oneshot::channel();
 
     let mut producer = Box::pin(con.run_async());
-    let consumer = tokio::spawn(consume(rx, state.clone(), sse_tx.clone(), signed_in_players.clone()));
+    let consumer = tokio::spawn(consume(rx, state.clone(), sse_tx.clone()));
     let server = tokio::spawn(server(rx_sig, server_config, Arc::new(app_state_with_sse)));
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            con.disconnect().unwrap();
-            producer.await.unwrap();
+            // Try to disconnect the DB connection and wait for the producer to finish.
+            if let Err(e) = con.disconnect() {
+                eprintln!("error disconnecting DB connection: {:?}", e);
+            }
+            let _ = producer.await;
 
-            tx.send(Message::Disconnect).unwrap();
-            tx_sig.send(()).unwrap();
+            // Notify the consumer to exit, but don't panic if the receiver is gone.
+            if let Err(e) = tx.send(Message::Disconnect) {
+                eprintln!("failed to send Disconnect message to consumer: {:?}", e);
+            }
+            if let Err(e) = tx_sig.send(()) {
+                eprintln!("failed to send shutdown signal to server: {:?}", e);
+            }
 
-            consumer.await.unwrap();
-            server.await.unwrap();
+            let _ = consumer.await;
+            let _ = server.await;
         },
         _ = &mut producer => {
             println!("server disconnect!");
 
-            tx.send(Message::Disconnect).unwrap();
-            tx_sig.send(()).unwrap();
+            if let Err(e) = tx.send(Message::Disconnect) {
+                eprintln!("failed to send Disconnect message to consumer: {:?}", e);
+            }
+            if let Err(e) = tx_sig.send(()) {
+                eprintln!("failed to send shutdown signal to server: {:?}", e);
+            }
 
-            consumer.await.unwrap();
-            server.await.unwrap();
+            let _ = consumer.await;
+            let _ = server.await;
         },
     }
 }
 
 async fn consume(
-    mut rx: UnboundedReceiver<Message>, 
-    state: Arc<AppState>, 
+    mut rx: UnboundedReceiver<Message>,
+    state: Arc<AppState>,
     sse_tx: broadcast::Sender<SseEvent>,
-    signed_in_players: Arc<TokioRwLock<HashSet<u64>>>,
 ) {
+    // Maintain a local set of signed-in players inside the consumer
+    let signed_in_players = TokioRwLock::new(HashSet::new());
+
     while let Some(msg) = rx.recv().await {
         match msg {
-            Message::Disconnect => { break; }
-
             Message::ResourceInsert { id, res, x, z } => {
                 if let Some(resource) = state.resource.get(res) {
                     resource.nodes.write().await.insert(id, [x, z]);
-                    // Send SSE event
-                    let _ = sse_tx.send(SseEvent {
-                        message: format!("insert:{}", res),
-                    });
+                    // Only send SSE if we have subscribers to avoid spamming logs when none are connected
+                    if sse_tx.receiver_count() > 0 {
+                        if let Err(e) = sse_tx.send(SseEvent { message: format!("insert:{}", res) }) {
+                            eprintln!("SSE send error (resource insert): {:?}", e);
+                        }
+                    }
                 }
             }
             Message::ResourceDelete { id, res } => {
                 if let Some(resource) = state.resource.get(res) {
                     resource.nodes.write().await.remove(id);
-                    // Send SSE event
-                    let _ = sse_tx.send(SseEvent {
-                        message: format!("delete:{}", res),
-                    });
+                    // Only send SSE if we have subscribers
+                    if sse_tx.receiver_count() > 0 {
+                        if let Err(e) = sse_tx.send(SseEvent { message: format!("delete:{}", res) }) {
+                            eprintln!("SSE send error (resource delete): {:?}", e);
+                        }
+                    }
                 }
             }
             Message::EnemyInsert { id, mob, x, z } => {
                 if let Some(enemy) = state.enemy.get(mob) {
                     enemy.nodes.write().await.insert(id, [x, z]);
-                    // Send SSE event for enemy insert
-                    let _ = sse_tx.send(SseEvent {
-                        message: format!("enemy_insert:{}", mob),
-                    });
+                    // Only send SSE if we have subscribers
+                    if sse_tx.receiver_count() > 0 {
+                        if let Err(e) = sse_tx.send(SseEvent { message: format!("enemy_insert:{}", mob) }) {
+                            eprintln!("SSE send error (enemy insert): {:?}", e);
+                        }
+                    }
                 }
             }
             Message::EnemyDelete { id, mob } => {
                 if let Some(enemy) = state.enemy.get(mob) {
                     enemy.nodes.write().await.remove(id);
-                    // Send SSE event for enemy delete
-                    let _ = sse_tx.send(SseEvent {
-                        message: format!("enemy_delete:{}", mob),
-                    });
+                    // Only send SSE if we have subscribers
+                    if sse_tx.receiver_count() > 0 {
+                        if let Err(e) = sse_tx.send(SseEvent { message: format!("enemy_delete:{}", mob) }) {
+                            eprintln!("SSE send error (enemy delete): {:?}", e);
+                        }
+                    }
                 }
             }
             Message::PlayerInsert { id, char, x, z } => {
@@ -277,10 +309,12 @@ async fn consume(
                 if signed_in_players.read().await.contains(&id) {
                     if let Some(player) = state.player.get(char) {
                         player.nodes.write().await.insert(id, [x, z]);
-                        // Send SSE event for player insert with entity ID
-                        let _ = sse_tx.send(SseEvent {
-                            message: format!("player_insert:{}:{}", char, id),
-                        });
+                        // Only send SSE if we have subscribers
+                        if sse_tx.receiver_count() > 0 {
+                            if let Err(e) = sse_tx.send(SseEvent { message: format!("player_insert:{}:{}", char, id) }) {
+                                eprintln!("SSE send error (player insert): {:?}", e);
+                            }
+                        }
                     } else {
                         eprintln!("Warning: Received PlayerInsert for unknown character {}", char);
                     }
@@ -294,10 +328,12 @@ async fn consume(
                 // since the player might have just signed out
                 if let Some(player) = state.player.get(char) {
                     if player.nodes.write().await.remove(id).is_some() {
-                        // Send SSE event for player delete with entity ID
-                        let _ = sse_tx.send(SseEvent {
-                            message: format!("player_delete:{}:{}", char, id),
-                        });
+                        // Only send SSE if we have subscribers
+                        if sse_tx.receiver_count() > 0 {
+                            if let Err(e) = sse_tx.send(SseEvent { message: format!("player_delete:{}:{}", char, id) }) {
+                                eprintln!("SSE send error (player delete): {:?}", e);
+                            }
+                        }
                     } else {
                         eprintln!("Warning: Tried to remove non-existent player entity {}", id);
                     }
@@ -307,7 +343,7 @@ async fn consume(
             }
             Message::PlayerSignIn { id, username } => {
                 signed_in_players.write().await.insert(id);
-                
+
                 // If we have a username, store it in all player groups
                 if let Some(username) = username {
                     for (_, player_group) in state.player.iter() {
@@ -317,16 +353,18 @@ async fn consume(
             }
             Message::PlayerSignOut { id } => {
                 signed_in_players.write().await.remove(&id);
-                
+
                 // Remove the player's location data from all player groups
                 for (char_id, player_group) in state.player.iter() {
                     if player_group.nodes.write().await.remove(id).is_some() {
                         // Also remove the player name
                         player_group.player_names.write().await.remove(&id);
-                        // Send SSE event for player removal with entity ID
-                        let _ = sse_tx.send(SseEvent {
-                            message: format!("player_delete:{}:{}", char_id, id),
-                        });
+                        // Only send SSE if we have subscribers
+                        if sse_tx.receiver_count() > 0 {
+                            if let Err(e) = sse_tx.send(SseEvent { message: format!("player_delete:{}:{}", char_id, id) }) {
+                                eprintln!("SSE send error (player signout/delete): {:?}", e);
+                            }
+                        }
                     }
                 }
             }
@@ -340,6 +378,15 @@ async fn consume(
                         player_group.player_names.write().await.insert(id, username.clone());
                     }
                 }
+            }
+            Message::Disconnect => {
+                // Send a final SSE event to tell clients the server is shutting down.
+                if sse_tx.receiver_count() > 0 {
+                    if let Err(e) = sse_tx.send(SseEvent { message: String::from("server_shutdown") }) {
+                        eprintln!("SSE send error (server shutdown): {:?}", e);
+                    }
+                }
+                break;
             }
         }
     }
@@ -414,13 +461,13 @@ async fn route_sse_events(
     let stream = BroadcastStream::new(rx)
         .map(|msg| {
             match msg {
-                Ok(sse_event) => {
-                    Ok(Event::default().data(sse_event.message))
-                }
-                Err(_) => {
-                    // Handle lagged messages by sending a reconnect event
-                    Ok(Event::default().event("reconnect").data(""))
-                }
+                Ok(sse_event) => Ok(Event::default().data(sse_event.message)),
+                Err(err) => match err {
+                    BroadcastStreamRecvError::Lagged(_) => {
+                        // Client missed messages; ask client to reconnect
+                        Ok(Event::default().event("reconnect").data(""))
+                    }
+                },
             }
         });
 
