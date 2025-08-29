@@ -1,7 +1,8 @@
 mod channels;
 mod config;
 mod subscription;
-use crate::{channels::*, config::*, subscription::*};
+mod sse;
+use crate::{channels::*, config::*, subscription::*, sse::*};
 
 use std::io::{stdout, Write};
 use std::sync::Arc;
@@ -14,17 +15,13 @@ use axum::{
     routing::get, 
     http::StatusCode, 
     extract::{Path, State},
-    response::{Sse, sse::Event}
 };
 use axum::http::{Method};
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, mpsc::{unbounded_channel, UnboundedReceiver}, broadcast};
-use tokio_stream::{wrappers::BroadcastStream, StreamExt as _};
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio::sync::{oneshot, mpsc::{unbounded_channel, UnboundedReceiver}};
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
-use futures_util::stream::Stream;
 use chrono;
 
 enum Message {
@@ -43,16 +40,6 @@ enum Message {
     PlayerSignOut { id: u64 },
     
     PlayerNameUpdate { id: u64, username: String },
-}
-
-#[derive(Clone, Debug)]
-struct SseEvent {
-    message: String,
-}
-
-struct AppStateWithSse {
-    app_state: Arc<AppState>,
-    sse_tx: broadcast::Sender<SseEvent>,
 }
 
 impl Message {
@@ -78,6 +65,40 @@ impl Message {
 
     pub fn player_delete(entity_id: u64) -> Self {
         Self::PlayerDelete { id: entity_id, char: 1 }
+    }
+}
+
+impl IntoSseEvent for Message {
+    fn into_sse_event(self) -> SseEvent {
+        match self {
+            Message::ResourceInsert { res, .. } => {
+                SseEvent::new(format!("insert:{}", res))
+            }
+            Message::ResourceDelete { res, .. } => {
+                SseEvent::new(format!("delete:{}", res))
+            }
+            Message::EnemyInsert { mob, .. } => {
+                SseEvent::new(format!("enemy_insert:{}", mob))
+            }
+            Message::EnemyDelete { mob, .. } => {
+                SseEvent::new(format!("enemy_delete:{}", mob))
+            }
+            Message::PlayerInsert { id, char, .. } => {
+                SseEvent::new(format!("player_insert:{}:{}", char, id))
+            }
+            Message::PlayerDelete { id, char } => {
+                SseEvent::new(format!("player_delete:{}:{}", char, id))
+            }
+            Message::Disconnect => {
+                SseEvent::new("server_shutdown".to_string())
+            }
+            // These don't generate SSE events, but we need to handle them
+            Message::PlayerSignIn { .. } |
+            Message::PlayerSignOut { .. } |
+            Message::PlayerNameUpdate { .. } => {
+                SseEvent::new("".to_string()) // Empty event for internal-only messages
+            }
+        }
     }
 }
 
@@ -108,11 +129,11 @@ async fn main() {
 
     let (state, db_config, sub, server_config) = config.build(sub);
 
-    // Create SSE broadcast channel
-    let (sse_tx, _) = broadcast::channel(1000);
+    // Create SSE manager with default configuration
+    let sse_manager = SseManager::default();
     let app_state_with_sse = AppStateWithSse {
         app_state: state.clone(),
-        sse_tx: sse_tx.clone(),
+        sse_manager: sse_manager.clone(),
     };
 
     let (tx, rx) = unbounded_channel();
@@ -212,7 +233,7 @@ async fn main() {
     let (tx_sig, rx_sig) = oneshot::channel();
 
     let mut producer = Box::pin(con.run_async());
-    let consumer = tokio::spawn(consume(rx, state.clone(), sse_tx.clone()));
+    let consumer = tokio::spawn(consume(rx, state.clone(), sse_manager.clone()));
     let server = tokio::spawn(server(rx_sig, server_config, Arc::new(app_state_with_sse)));
 
     tokio::select! {
@@ -253,54 +274,49 @@ async fn main() {
 async fn consume(
     mut rx: UnboundedReceiver<Message>,
     state: Arc<AppState>,
-    sse_tx: broadcast::Sender<SseEvent>,
+    sse_manager: SseManager,
 ) {
     // Maintain a local set of signed-in players inside the consumer
     let signed_in_players = TokioRwLock::new(HashSet::new());
+    
+    // Create SSE message processor for handling event sending
+    let sse_processor = SseMessageProcessor::new(sse_manager);
 
     while let Some(msg) = rx.recv().await {
         match msg {
             Message::ResourceInsert { id, res, x, z } => {
                 if let Some(resource) = state.resource.get(res) {
                     resource.nodes.write().await.insert(id, [x, z]);
-                    // Only send SSE if we have subscribers to avoid spamming logs when none are connected
-                    if sse_tx.receiver_count() > 0 {
-                        if let Err(e) = sse_tx.send(SseEvent { message: format!("insert:{}", res) }) {
-                            eprintln!("SSE send error (resource insert): {:?}", e);
-                        }
+                    // Use the processor for cleaner event handling
+                    if let Err(e) = sse_processor.process_resource_insert(res, id, x, z) {
+                        eprintln!("Failed to process resource insert SSE event: {:?}", e);
                     }
                 }
             }
             Message::ResourceDelete { id, res } => {
                 if let Some(resource) = state.resource.get(res) {
                     resource.nodes.write().await.remove(id);
-                    // Only send SSE if we have subscribers
-                    if sse_tx.receiver_count() > 0 {
-                        if let Err(e) = sse_tx.send(SseEvent { message: format!("delete:{}", res) }) {
-                            eprintln!("SSE send error (resource delete): {:?}", e);
-                        }
+                    // Use the processor for cleaner event handling
+                    if let Err(e) = sse_processor.process_resource_delete(res, id) {
+                        eprintln!("Failed to process resource delete SSE event: {:?}", e);
                     }
                 }
             }
             Message::EnemyInsert { id, mob, x, z } => {
                 if let Some(enemy) = state.enemy.get(mob) {
                     enemy.nodes.write().await.insert(id, [x, z]);
-                    // Only send SSE if we have subscribers
-                    if sse_tx.receiver_count() > 0 {
-                        if let Err(e) = sse_tx.send(SseEvent { message: format!("enemy_insert:{}", mob) }) {
-                            eprintln!("SSE send error (enemy insert): {:?}", e);
-                        }
+                    // Use the processor for cleaner event handling
+                    if let Err(e) = sse_processor.process_enemy_insert(mob, id, x, z) {
+                        eprintln!("Failed to process enemy insert SSE event: {:?}", e);
                     }
                 }
             }
             Message::EnemyDelete { id, mob } => {
                 if let Some(enemy) = state.enemy.get(mob) {
                     enemy.nodes.write().await.remove(id);
-                    // Only send SSE if we have subscribers
-                    if sse_tx.receiver_count() > 0 {
-                        if let Err(e) = sse_tx.send(SseEvent { message: format!("enemy_delete:{}", mob) }) {
-                            eprintln!("SSE send error (enemy delete): {:?}", e);
-                        }
+                    // Use the processor for cleaner event handling
+                    if let Err(e) = sse_processor.process_enemy_delete(mob, id) {
+                        eprintln!("Failed to process enemy delete SSE event: {:?}", e);
                     }
                 }
             }
@@ -309,11 +325,9 @@ async fn consume(
                 if signed_in_players.read().await.contains(&id) {
                     if let Some(player) = state.player.get(char) {
                         player.nodes.write().await.insert(id, [x, z]);
-                        // Only send SSE if we have subscribers
-                        if sse_tx.receiver_count() > 0 {
-                            if let Err(e) = sse_tx.send(SseEvent { message: format!("player_insert:{}:{}", char, id) }) {
-                                eprintln!("SSE send error (player insert): {:?}", e);
-                            }
+                        // Use the processor for cleaner event handling
+                        if let Err(e) = sse_processor.process_player_insert(char, id, x, z) {
+                            eprintln!("Failed to process player insert SSE event: {:?}", e);
                         }
                     } else {
                         eprintln!("Warning: Received PlayerInsert for unknown character {}", char);
@@ -328,11 +342,9 @@ async fn consume(
                 // since the player might have just signed out
                 if let Some(player) = state.player.get(char) {
                     if player.nodes.write().await.remove(id).is_some() {
-                        // Only send SSE if we have subscribers
-                        if sse_tx.receiver_count() > 0 {
-                            if let Err(e) = sse_tx.send(SseEvent { message: format!("player_delete:{}:{}", char, id) }) {
-                                eprintln!("SSE send error (player delete): {:?}", e);
-                            }
+                        // Use the processor for cleaner event handling
+                        if let Err(e) = sse_processor.process_player_delete(char, id) {
+                            eprintln!("Failed to process player delete SSE event: {:?}", e);
                         }
                     } else {
                         eprintln!("Warning: Tried to remove non-existent player entity {}", id);
@@ -359,11 +371,9 @@ async fn consume(
                     if player_group.nodes.write().await.remove(id).is_some() {
                         // Also remove the player name
                         player_group.player_names.write().await.remove(&id);
-                        // Only send SSE if we have subscribers
-                        if sse_tx.receiver_count() > 0 {
-                            if let Err(e) = sse_tx.send(SseEvent { message: format!("player_delete:{}:{}", char_id, id) }) {
-                                eprintln!("SSE send error (player signout/delete): {:?}", e);
-                            }
+                        // Use the processor for cleaner event handling
+                        if let Err(e) = sse_processor.process_player_delete(char_id, id) {
+                            eprintln!("Failed to process player signout/delete SSE event: {:?}", e);
                         }
                     }
                 }
@@ -381,10 +391,8 @@ async fn consume(
             }
             Message::Disconnect => {
                 // Send a final SSE event to tell clients the server is shutting down.
-                if sse_tx.receiver_count() > 0 {
-                    if let Err(e) = sse_tx.send(SseEvent { message: String::from("server_shutdown") }) {
-                        eprintln!("SSE send error (server shutdown): {:?}", e);
-                    }
+                if let Err(e) = sse_processor.process_server_shutdown() {
+                    eprintln!("Failed to process server shutdown SSE event: {:?}", e);
                 }
                 break;
             }
@@ -392,16 +400,16 @@ async fn consume(
     }
 }
 
-async fn server(rx: oneshot::Receiver<()>, config: ServerConfig, state: Arc<AppStateWithSse>) {
+async fn server(rx: oneshot::Receiver<()>, config: ServerConfig, state: Arc<AppStateWithSse<AppState>>) {
     let mut app = Router::new()
         .route("/resource/{id}", get(route_resource_id))
         .route("/enemy/{id}", get(route_enemy_id))
         .route("/player/{id}", get(route_player_id))
-        .route("/events", get(route_sse_events))
         .route("/health", get(route_health))
         .route("/resources", get(route_resources))
         .route("/enemies", get(route_enemies))
         .route("/players", get(route_players))
+        .merge(create_sse_router())  // Add SSE routes via the SSE module
         .layer(CompressionLayer::new().gzip(true).zstd(true))
         .with_state(state);
 
@@ -430,19 +438,19 @@ async fn server(rx: oneshot::Receiver<()>, config: ServerConfig, state: Arc<AppS
 }
 
 async fn route_resources(
-    state: State<Arc<AppStateWithSse>>,
+    state: State<Arc<AppStateWithSse<AppState>>>,
 ) -> Json<Value> {
     Json(serde_json::json!(state.app_state.resources_list))
 }
 
 async fn route_enemies(
-    state: State<Arc<AppStateWithSse>>,
+    state: State<Arc<AppStateWithSse<AppState>>>,
 ) -> Json<Value> {
     Json(serde_json::json!(state.app_state.enemies_list))
 }
 
 async fn route_players(
-    state: State<Arc<AppStateWithSse>>,
+    state: State<Arc<AppStateWithSse<AppState>>>,
 ) -> Json<Value> {
     Json(serde_json::json!(state.app_state.players_list))
 }
@@ -454,33 +462,9 @@ async fn route_health() -> Json<Value> {
     }))
 }
 
-async fn route_sse_events(
-    state: State<Arc<AppStateWithSse>>,
-) -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
-    let rx = state.sse_tx.subscribe();
-    let stream = BroadcastStream::new(rx)
-        .map(|msg| {
-            match msg {
-                Ok(sse_event) => Ok(Event::default().data(sse_event.message)),
-                Err(err) => match err {
-                    BroadcastStreamRecvError::Lagged(_) => {
-                        // Client missed messages; ask client to reconnect
-                        Ok(Event::default().event("reconnect").data(""))
-                    }
-                },
-            }
-        });
-
-    Sse::new(stream).keep_alive(
-        axum::response::sse::KeepAlive::new()
-            .interval(std::time::Duration::from_secs(30))
-            .text("keep-alive"),
-    )
-}
-
 async fn route_resource_id(
     Path(id): Path<i32>,
-    state: State<Arc<AppStateWithSse>>,
+    state: State<Arc<AppStateWithSse<AppState>>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let Some(resource) = state.app_state.resource.get(id) else {
         return Err((StatusCode::NOT_FOUND, format!("Resource ID not found: {}", id)))
@@ -499,7 +483,7 @@ async fn route_resource_id(
 
 async fn route_enemy_id(
     Path(id): Path<i32>,
-    state: State<Arc<AppStateWithSse>>,
+    state: State<Arc<AppStateWithSse<AppState>>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let Some(enemy) = state.app_state.enemy.get(id) else {
         return Err((StatusCode::NOT_FOUND, format!("Enemy ID not found: {}", id)))
@@ -529,7 +513,7 @@ async fn route_enemy_id(
 
 async fn route_player_id(
     Path(id): Path<i32>,
-    state: State<Arc<AppStateWithSse>>,
+    state: State<Arc<AppStateWithSse<AppState>>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let Some(player) = state.app_state.player.get(id) else {
         return Err((StatusCode::NOT_FOUND, format!("Player ID not found: {}", id)))
