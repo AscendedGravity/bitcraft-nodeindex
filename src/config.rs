@@ -1,6 +1,7 @@
-use std::{net::SocketAddr, path::Path, sync::Arc, collections::HashMap};
+use std::{net::SocketAddr, path::Path, sync::Arc};
 use bindings::sdk::{DbConnectionBuilder, __codegen::SpacetimeModule};
 use anyhow::{anyhow, Result};
+use hashbrown::HashMap;
 use serde::{Serialize, Deserialize};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;

@@ -34,6 +34,7 @@ async fn main() {
     let mut queries = Vec::new();
     if !state.enemy.is_empty() { queries.push(Query::ENEMY) }
     for id in state.resource.keys() { queries.push(Query::RESOURCE(*id)) }
+    if !state.player.is_empty() { queries.push(Query::PLAYER) }
 
     // Create SSE manager with default configuration
     let sse_manager = SseManager::default();
@@ -69,7 +70,7 @@ async fn main() {
         .build()
         .unwrap();
 
-    tokio::spawn(consume_with_sse(rx, state.clone(), sse_manager.clone()));
+    tokio::spawn(database::consume_with_sse(rx, state.clone(), sse_manager.clone()));
 
     let (con, server) = tokio::join!(
         tokio::spawn(con.run_until(tokio::signal::ctrl_c())),
@@ -167,6 +168,7 @@ async fn route_player_id(
     Path(id): Path<i32>,
     state: State<Arc<AppStateWithSse<AppState>>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    // Check if player tracking is configured
     let Some(player) = state.app_state.player.get(&id) else {
         return Err((StatusCode::NOT_FOUND, format!("Player ID not found: {}", id)))
     };
@@ -177,7 +179,7 @@ async fn route_player_id(
     let features: Vec<serde_json::Value> = nodes
         .iter()
         .map(|(entity_id, coords)| {
-            let player_name = player_names.get(&entity_id)
+            let player_name = player_names.get(entity_id)
                 .cloned()
                 .unwrap_or_else(|| format!("Player_{}", entity_id));
             
@@ -225,22 +227,4 @@ async fn route_health() -> Json<Value> {
         "status": "ok",
         "timestamp": chrono::Utc::now().to_rfc3339()
     }))
-}
-
-// Enhanced consume function that integrates with the simplified database approach
-async fn consume_with_sse(
-    rx: tokio::sync::mpsc::UnboundedReceiver<bindings::region::DbUpdate>,
-    state: Arc<AppState>,
-    sse_manager: SseManager,
-) {
-    // Create SSE message processor for handling event sending
-    let _sse_processor = SseMessageProcessor::new(sse_manager);
-    
-    // Use the standard database consume function
-    // For now, we'll run the database consumer and add basic SSE notification
-    database::consume(rx, state.clone()).await;
-    
-    // In a production implementation, you'd want to integrate SSE events
-    // directly into the database::consume function to detect specific changes
-    // and send targeted SSE events. For now, this provides the basic structure.
 }

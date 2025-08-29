@@ -5,6 +5,7 @@ use tracing::info;
 pub enum Query {
     ENEMY,
     RESOURCE(i32),
+    PLAYER,
 }
 
 impl Query {
@@ -27,6 +28,11 @@ impl Query {
                     "SELECT loc.* FROM location_state loc",
                     " JOIN resource_state res ON loc.entity_id = res.entity_id",
                     " WHERE res.resource_id = {};"), id),
+            ],
+            Query::PLAYER => vec![
+                "SELECT loc.* FROM mobile_entity_state loc;".to_string(),
+                "SELECT sip.* FROM signed_in_player_state sip;".to_string(),
+                "SELECT pus.* FROM player_username_state pus;".to_string(),
             ]
         }
     }
