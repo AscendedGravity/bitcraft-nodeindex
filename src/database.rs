@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use bindings::region::DbUpdate;
 use hashbrown::{HashMap, HashSet};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -101,6 +102,14 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
     let mut enemy_state = HashMap::new();
     // player tracking for entity ID mapping (signed-in players)
     let mut player_entity_map: HashMap<u64, u64> = HashMap::new();
+    // player event throttling: track last SSE event time per player
+    let mut player_last_sse_time: HashMap<u64, u64> = HashMap::new();
+    // global throttling: track last SSE event time for any player
+    let mut global_last_player_event_time: u64 = 0;
+    
+    // Throttling configuration
+    const PLAYER_MOVEMENT_THROTTLE_MS: u64 = 3000; // Max 1 movement event per 3 seconds per player
+    const GLOBAL_PLAYER_EVENT_THROTTLE_MS: u64 = 1200; // Min 1200ms between any player events (longer than frontend's 1000ms debounce)
 
     while let Some(update) = rx.recv().await {
         // location_state should always be inserted in the batch the corresponding entity
@@ -178,8 +187,17 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
                     nodes.insert(e.row.entity_id, [e.row.location_x, e.row.location_z]);
                 }
                 
-                // Send SSE event for player position update
-                let _ = sse_processor.process_player_insert(e.row.entity_id as i32, e.row.entity_id, e.row.location_x, e.row.location_z);
+                // Send throttled SSE event for player movement
+                let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                let last_event_time = player_last_sse_time.get(&e.row.entity_id).copied().unwrap_or(0);
+                
+                // Check both per-player throttle AND global throttle
+                if current_time - last_event_time >= PLAYER_MOVEMENT_THROTTLE_MS && 
+                   current_time - global_last_player_event_time >= GLOBAL_PLAYER_EVENT_THROTTLE_MS {
+                    let _ = sse_processor.process_player_insert(1, e.row.entity_id, e.row.location_x, e.row.location_z);
+                    player_last_sse_time.insert(e.row.entity_id, current_time);
+                    global_last_player_event_time = current_time;
+                }
             }
         }
 
@@ -208,16 +226,30 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
             // For signed-in players, we only have entity_id
             player_entity_map.insert(e.row.entity_id, e.row.entity_id);
             
-            // Send SSE event for player login (using entity_id as char_id for now)
-            let _ = sse_processor.process_player_insert(e.row.entity_id as i32, e.row.entity_id, 0, 0);
+            // Send SSE event for player login immediately (but respect global throttle)
+            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+            if current_time - global_last_player_event_time >= GLOBAL_PLAYER_EVENT_THROTTLE_MS {
+                let _ = sse_processor.process_player_insert(1, e.row.entity_id, 0, 0);
+                global_last_player_event_time = current_time;
+            }
+            
+            // Reset throttling timer for this player to allow movement updates sooner
+            player_last_sse_time.insert(e.row.entity_id, current_time - PLAYER_MOVEMENT_THROTTLE_MS);
         }
         
         for e in update.signed_in_player_state.deletes {
             let entity_id = e.row.entity_id;
             player_entity_map.remove(&entity_id);
             
-            // Send SSE event for player logout
-            let _ = sse_processor.process_player_delete(entity_id as i32, entity_id);
+            // Send SSE event for player logout (respect global throttle)
+            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+            if current_time - global_last_player_event_time >= GLOBAL_PLAYER_EVENT_THROTTLE_MS {
+                let _ = sse_processor.process_player_delete(1, entity_id);
+                global_last_player_event_time = current_time;
+            }
+            
+            // Clean up throttling tracking for logged out player
+            player_last_sse_time.remove(&entity_id);
             
             // Remove from player tracking
             if let Some(player_group) = state.player.get(&1) {
