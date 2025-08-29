@@ -4,6 +4,7 @@ use bindings::region::DbUpdate;
 use hashbrown::{HashMap, HashSet};
 use tokio::sync::mpsc::UnboundedReceiver;
 use crate::config::AppState;
+use tracing::info;
 use crate::sse::{SseManager, SseMessageProcessor};
 
 struct Update {
@@ -102,6 +103,8 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
     let mut enemy_state = HashMap::new();
     // player tracking for entity ID mapping (signed-in players)
     let mut player_entity_map: HashMap<u64, u64> = HashMap::new();
+    // last-known usernames cache so we can restore a username quickly when a player signs in
+    let mut player_last_known_names: HashMap<u64, String> = HashMap::new();
     // player event throttling: track last SSE event time per player
     let mut player_last_sse_time: HashMap<u64, u64> = HashMap::new();
     // global throttling: track last SSE event time for any player
@@ -218,6 +221,11 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
             if let Some(player_group) = state.player.get(&1) { // Using player ID 1 for "All Players"
                 let mut player_names = player_group.player_names.write().await;
                 player_names.insert(e.row.entity_id, e.row.username.clone());
+                // update last-known cache so we can restore it on sign-in even if the username event
+                // does not arrive before the signed_in_player_state.insert (race conditions)
+                player_last_known_names.insert(e.row.entity_id, e.row.username.clone());
+                // Log username insertion for diagnostics
+                info!("player_username_state.insert: entity_id={} username={}", e.row.entity_id, e.row.username);
             }
         }
 
@@ -225,6 +233,16 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
         for e in update.signed_in_player_state.inserts {
             // For signed-in players, we only have entity_id
             player_entity_map.insert(e.row.entity_id, e.row.entity_id);
+            // Ensure we have a username available immediately: restore last-known username if present
+            if let Some(player_group) = state.player.get(&1) {
+                let mut player_names = player_group.player_names.write().await;
+                if !player_names.contains_key(&e.row.entity_id) {
+                    if let Some(name) = player_last_known_names.get(&e.row.entity_id) {
+                        player_names.insert(e.row.entity_id, name.clone());
+                        info!("signed_in_player_state.insert: restored last-known username for entity_id={} -> {}", e.row.entity_id, name);
+                    }
+                }
+            }
             
             // Send SSE event for player login immediately (but respect global throttle)
             let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -257,6 +275,7 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
                 let mut player_names = player_group.player_names.write().await;
                 nodes.remove(&entity_id);
                 player_names.remove(&entity_id);
+                info!("signed_in_player_state.delete: entity_id={} - removed tracking and username", entity_id);
             }
         }
 

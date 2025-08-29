@@ -181,7 +181,11 @@ async fn route_player_id(
         .map(|(entity_id, coords)| {
             let player_name = player_names.get(entity_id)
                 .cloned()
-                .unwrap_or_else(|| format!("Player_{}", entity_id));
+                .unwrap_or_else(|| {
+                    let def = format!("Player_{}", entity_id);
+                    tracing::info!("route_player_id: defaulting player_name for entity_id={} to {}", entity_id, def);
+                    def
+                });
             
             serde_json::json!({
                 "type": "Feature",
