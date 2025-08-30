@@ -192,21 +192,25 @@ async fn route_player_id(
                                 // refresh timestamp and use name
                                 *ts = chrono::Utc::now().timestamp_millis() as u64;
                                 restored = Some(name.clone());
+                                tracing::info!("route_player_id: restored cached username for entity_id={} -> {}", entity_id, name);
                             }
                         } else {
                             // Fall back to read lock if write not available
                             let last_known = player_group.last_known_names.blocking_read();
                             if let Some((name, _)) = last_known.get(entity_id) {
                                 restored = Some(name.clone());
+                                tracing::info!("route_player_id: found cached username for entity_id={} -> {}", entity_id, name);
                             }
                         }
+                    } else {
+                        tracing::warn!("route_player_id: could not get player_group for player ID 1");
                     }
 
                     if let Some(name) = restored {
                         name
                     } else {
                         let def = format!("Player_{}", entity_id);
-                        tracing::info!("route_player_id: defaulting player_name for entity_id={} to {}", entity_id, def);
+                        tracing::warn!("route_player_id: no cached username found for entity_id={}, using placeholder: {}", entity_id, def);
                         def
                     }
                 }
