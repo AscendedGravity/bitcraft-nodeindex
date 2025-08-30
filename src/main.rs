@@ -19,8 +19,6 @@ use chrono;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
-
     let config = match AppConfig::from("config.json") {
         Ok(config) => config,
         Err(err) => {
@@ -28,6 +26,19 @@ async fn main() {
             return;
         }
     };
+
+    // Configure logging with levels from config.json or environment
+    let logging_level = &config.server.logging_level;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| {
+                    // Use config-based log level with database module at warn to suppress debug noise
+                    let filter_string = format!("{},nodeindex::database=warn", logging_level);
+                    tracing_subscriber::EnvFilter::new(filter_string)
+                })
+        )
+        .init();
 
     let (state, db_config, server_config) = config.build();
 

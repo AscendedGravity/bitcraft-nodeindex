@@ -62,14 +62,6 @@ impl SseEvent {
             event_type: None,
         }
     }
-    
-    /// Create a new SSE event with a message and event type
-    pub fn with_type(message: String, event_type: String) -> Self {
-        Self {
-            message,
-            event_type: Some(event_type),
-        }
-    }
 }
 
 /// SSE-specific error types
@@ -77,15 +69,6 @@ impl SseEvent {
 pub enum SseError {
     #[error("Channel send failed: {0}")]
     ChannelSend(#[from] broadcast::error::SendError<SseEvent>),
-    
-    #[error("No subscribers available")]
-    NoSubscribers,
-    
-    #[error("SSE manager not initialized")]
-    NotInitialized,
-    
-    #[error("Configuration error: {0}")]
-    Config(String),
 }
 
 /// Core SSE manager for handling event broadcasting
@@ -110,16 +93,6 @@ impl SseManager {
     /// Subscribe to SSE events
     pub fn subscribe(&self) -> broadcast::Receiver<SseEvent> {
         self.tx.subscribe()
-    }
-    
-    /// Send an SSE event to all subscribers
-    pub fn send_event(&self, event: SseEvent) -> Result<(), SseError> {
-        if self.tx.receiver_count() > 0 {
-            self.tx.send(event)?;
-            Ok(())
-        } else {
-            Err(SseError::NoSubscribers)
-        }
     }
     
     /// Send an SSE event only if there are subscribers (no error if none)
@@ -168,37 +141,6 @@ impl SseManager {
         self.send_event_if_subscribers(event)
     }
     
-    /// Send a server shutdown event
-    pub fn send_server_shutdown(&self) -> Result<bool, SseError> {
-        let event = SseEvent::new("server_shutdown".to_string());
-        self.send_event_if_subscribers(event)
-    }
-    
-    /// Send a custom event with message and optional event type
-    pub fn send_custom_event(&self, message: String, event_type: Option<String>) -> Result<bool, SseError> {
-        let event = if let Some(event_type) = event_type {
-            SseEvent::with_type(message, event_type)
-        } else {
-            SseEvent::new(message)
-        };
-        self.send_event_if_subscribers(event)
-    }
-    
-    /// Check if there are any active subscribers
-    pub fn has_subscribers(&self) -> bool {
-        self.tx.receiver_count() > 0
-    }
-    
-    /// Get the number of active subscribers
-    pub fn subscriber_count(&self) -> usize {
-        self.tx.receiver_count()
-    }
-    
-    /// Get the broadcast sender (for compatibility with existing code)
-    pub fn sender(&self) -> broadcast::Sender<SseEvent> {
-        self.tx.clone()
-    }
-    
     /// Get SSE configuration
     pub fn config(&self) -> &SseConfig {
         &self.config
@@ -209,24 +151,12 @@ impl SseManager {
         Duration::from_secs(self.config.keep_alive_interval_secs)
     }
     
-    /// Log SSE event sending with context
-    pub fn log_event_sent(&self, event_type: &str, count: usize) {
-        if self.config.verbose_logging && count > 0 {
-            println!("SSE: Sent {} event to {} subscriber(s)", event_type, count);
-        }
-    }
-    
     /// Log SSE error with context
     pub fn log_error(&self, operation: &str, error: &SseError) {
         if self.config.verbose_logging {
             eprintln!("SSE Error during {}: {:?}", operation, error);
         }
     }
-}
-
-/// Trait for converting messages into SSE events
-pub trait IntoSseEvent {
-    fn into_sse_event(self) -> SseEvent;
 }
 
 /// Message processor for handling complex SSE event logic
@@ -347,43 +277,6 @@ impl SseMessageProcessor {
             }
         }
     }
-    
-    /// Process a server shutdown message
-    pub fn process_server_shutdown(&self) -> Result<(), SseError> {
-        match self.manager.send_server_shutdown() {
-            Ok(true) => {
-                if self.manager.config.verbose_logging {
-                    println!("SSE: Server shutdown event sent to all subscribers");
-                }
-                Ok(())
-            }
-            Ok(false) => {
-                if self.manager.config.verbose_logging {
-                    println!("SSE: Server shutdown - no active subscribers");
-                }
-                Ok(())
-            }
-            Err(e) => {
-                self.manager.log_error("server shutdown", &e);
-                Err(e)
-            }
-        }
-    }
-    
-    /// Get reference to the underlying SSE manager
-    pub fn manager(&self) -> &SseManager {
-        &self.manager
-    }
-    
-    /// Check if there are active subscribers
-    pub fn has_subscribers(&self) -> bool {
-        self.manager.has_subscribers()
-    }
-    
-    /// Get the number of active subscribers
-    pub fn subscriber_count(&self) -> usize {
-        self.manager.subscriber_count()
-    }
 }
 
 // === HTTP Route Integration ===
@@ -458,9 +351,8 @@ mod tests {
     #[test]
     fn test_sse_manager_creation() {
         let config = SseConfig::default();
-        let manager = SseManager::new(config);
-        assert_eq!(manager.subscriber_count(), 0);
-        assert!(!manager.has_subscribers());
+        let _manager = SseManager::new(config);
+        // Test that manager can be created successfully
     }
     
     #[test]
@@ -468,10 +360,6 @@ mod tests {
         let event = SseEvent::new("test message".to_string());
         assert_eq!(event.message, "test message");
         assert!(event.event_type.is_none());
-        
-        let event_with_type = SseEvent::with_type("test message".to_string(), "test_event".to_string());
-        assert_eq!(event_with_type.message, "test message");
-        assert_eq!(event_with_type.event_type, Some("test_event".to_string()));
     }
     
     #[tokio::test]
@@ -479,14 +367,13 @@ mod tests {
         let manager = SseManager::default();
         let mut rx = manager.subscribe();
         
-        assert_eq!(manager.subscriber_count(), 1);
-        assert!(manager.has_subscribers());
-        
-        let event = SseEvent::new("test event".to_string());
-        manager.send_event(event.clone()).unwrap();
+        // Test resource insert
+        let result = manager.send_resource_insert(1);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), true);
         
         let received = rx.recv().await.unwrap();
-        assert_eq!(received.message, "test event");
+        assert_eq!(received.message, "insert:1");
         assert!(received.event_type.is_none());
     }
     
@@ -528,20 +415,12 @@ mod tests {
         let result = manager.send_resource_insert(1);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), false);
-        
-        let result = manager.send_server_shutdown();
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), false);
     }
     
     #[test]
     fn test_message_processor_creation() {
         let manager = SseManager::default();
-        let processor = SseMessageProcessor::new(manager.clone());
-        
-        assert_eq!(processor.subscriber_count(), 0);
-        assert!(!processor.has_subscribers());
-        // Test that the processor has access to the manager functionality
-        assert_eq!(processor.manager().subscriber_count(), manager.subscriber_count());
+        let _processor = SseMessageProcessor::new(manager);
+        // Test that the processor can be created successfully
     }
 }

@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 
 fn default_properties() -> Value { json!({ "makeCanvas": "10" }) }
 fn default_socket_addr() -> SocketAddr { SocketAddr::from(([0, 0, 0, 0], 3000)) }
+fn default_logging_level() -> String { "info".to_string() }
 
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -33,6 +34,8 @@ pub struct ServerConfig {
     pub socket_addr: SocketAddr,
     #[serde(default = "Default::default")]
     pub cors_origin: String,
+    #[serde(default = "default_logging_level")]
+    pub logging_level: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -79,6 +82,9 @@ impl AppConfig {
         }
         if let Ok(cors_origin) = std::env::var("CORS_ORIGIN") {
             config.server.cors_origin = cors_origin;
+        }
+        if let Ok(logging_level) = std::env::var("LOGGING_LEVEL") {
+            config.server.logging_level = logging_level;
         }
 
         if config.db.token.is_empty() {
