@@ -179,13 +179,38 @@ async fn route_player_id(
     let features: Vec<serde_json::Value> = nodes
         .iter()
         .map(|(entity_id, coords)| {
-            let player_name = player_names.get(entity_id)
-                .cloned()
-                .unwrap_or_else(|| {
-                    let def = format!("Player_{}", entity_id);
-                    tracing::info!("route_player_id: defaulting player_name for entity_id={} to {}", entity_id, def);
-                    def
-                });
+            // Resolve player name: check active player_names, then shared last_known_names, then default
+            let player_name = match player_names.get(entity_id) {
+                Some(name) => name.clone(),
+                None => {
+                    // try shared last_known_names in state
+                    let mut restored: Option<String> = None;
+                    if let Some(player_group) = state.app_state.player.get(&1) {
+                        // read last_known_names and check TTL
+                        if let Ok(mut last_known) = player_group.last_known_names.try_write() {
+                            if let Some((name, ts)) = last_known.get_mut(entity_id) {
+                                // refresh timestamp and use name
+                                *ts = chrono::Utc::now().timestamp_millis() as u64;
+                                restored = Some(name.clone());
+                            }
+                        } else {
+                            // Fall back to read lock if write not available
+                            let last_known = player_group.last_known_names.blocking_read();
+                            if let Some((name, _)) = last_known.get(entity_id) {
+                                restored = Some(name.clone());
+                            }
+                        }
+                    }
+
+                    if let Some(name) = restored {
+                        name
+                    } else {
+                        let def = format!("Player_{}", entity_id);
+                        tracing::info!("route_player_id: defaulting player_name for entity_id={} to {}", entity_id, def);
+                        def
+                    }
+                }
+            };
             
             serde_json::json!({
                 "type": "Feature",

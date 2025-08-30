@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use bindings::region::DbUpdate;
 use hashbrown::{HashMap, HashSet};
+use std::hash::Hash;
 use tokio::sync::mpsc::UnboundedReceiver;
 use crate::config::AppState;
 use tracing::info;
@@ -103,7 +104,77 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
     // player tracking for entity ID mapping (signed-in players)
     let mut player_entity_map: HashMap<u64, u64> = HashMap::new();
     // last-known usernames cache so we can restore a username quickly when a player signs in
-    let mut player_last_known_names: HashMap<u64, String> = HashMap::new();
+    // Use a TTL+LRU-style cache (timestamp-based) so we retain recent players but evict old ones.
+    #[derive(Debug)]
+    struct TtlLruCache<K, V> {
+        map: HashMap<K, (V, u64)>, // value + last-seen timestamp (ms)
+        capacity: usize,
+        ttl_ms: u64,
+    }
+
+    impl<K, V> TtlLruCache<K, V>
+    where
+        K: Eq + Hash + Copy,
+        V: Clone,
+    {
+        fn new(capacity: usize, ttl_ms: u64) -> Self {
+            Self { map: HashMap::new(), capacity, ttl_ms }
+        }
+
+        fn now_ms() -> u64 {
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+        }
+
+        fn insert(&mut self, key: K, value: V) {
+            let ts = Self::now_ms();
+            self.map.insert(key, (value, ts));
+            self.prune_if_needed();
+        }
+
+        fn get(&mut self, key: &K) -> Option<V> {
+            if let Some((val, ts)) = self.map.get_mut(key) {
+                let now = Self::now_ms();
+                // Evict if expired
+                if now.saturating_sub(*ts) >= self.ttl_ms {
+                    self.map.remove(key);
+                    return None;
+                }
+                // update last-seen timestamp
+                *ts = now;
+                return Some(val.clone());
+            }
+            None
+        }
+
+        fn remove(&mut self, key: &K) -> Option<V> {
+            self.map.remove(key).map(|(v, _)| v)
+        }
+
+        fn prune_if_needed(&mut self) {
+            let now = Self::now_ms();
+            // First remove expired entries
+            let mut expired = Vec::new();
+            for (k, (_, ts)) in self.map.iter() {
+                if now.saturating_sub(*ts) >= self.ttl_ms {
+                    expired.push(*k);
+                }
+            }
+            for k in expired { self.map.remove(&k); }
+
+            // Enforce capacity by removing least-recently-seen entries (smallest timestamp)
+            while self.map.len() > self.capacity {
+                if let Some((&old_key, _)) = self.map.iter().min_by_key(|(_, (_, ts))| *ts) {
+                    self.map.remove(&old_key);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // TTL configuration for shared last-known names in `AppState`
+    const LAST_KNOWN_TTL_MS: u64 = 3_600_000; // 1 hour
+    const LAST_KNOWN_CAPACITY: usize = 3000; // soft capacity per player group (not enforced globally)
     // player event throttling: track last SSE event time per player
     let mut player_last_sse_time: HashMap<u64, u64> = HashMap::new();
     // global throttling: track last SSE event time for any player
@@ -220,9 +291,10 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
             if let Some(player_group) = state.player.get(&1) { // Using player ID 1 for "All Players"
                 let mut player_names = player_group.player_names.write().await;
                 player_names.insert(e.row.entity_id, e.row.username.clone());
-                // update last-known cache so we can restore it on sign-in even if the username event
-                // does not arrive before the signed_in_player_state.insert (race conditions)
-                player_last_known_names.insert(e.row.entity_id, e.row.username.clone());
+                // update last-known map in shared state so we can restore it on sign-in
+                let mut last_known = player_group.last_known_names.write().await;
+                let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                last_known.insert(e.row.entity_id, (e.row.username.clone(), ts));
                 // Log username insertion for diagnostics
                 info!("player_username_state.insert: entity_id={} username={}", e.row.entity_id, e.row.username);
             }
@@ -236,9 +308,29 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
             if let Some(player_group) = state.player.get(&1) {
                 let mut player_names = player_group.player_names.write().await;
                 if !player_names.contains_key(&e.row.entity_id) {
-                    if let Some(name) = player_last_known_names.get(&e.row.entity_id) {
-                        player_names.insert(e.row.entity_id, name.clone());
-                        info!("signed_in_player_state.insert: restored last-known username for entity_id={} -> {}", e.row.entity_id, name);
+                    // Try to restore from shared last-known map
+                    if let Some(player_group) = state.player.get(&1) {
+                        let mut last_known = player_group.last_known_names.write().await;
+                        if let Some((name, ts)) = last_known.get_mut(&e.row.entity_id) {
+                            // Check TTL
+                            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                            if now.saturating_sub(*ts) < LAST_KNOWN_TTL_MS {
+                                player_names.insert(e.row.entity_id, name.clone());
+                                // refresh timestamp
+                                *ts = now;
+                                info!("signed_in_player_state.insert: restored last-known username for entity_id={} -> {}", e.row.entity_id, name);
+                            } else {
+                                // expired, remove it
+                                last_known.remove(&e.row.entity_id);
+                            }
+                        }
+                        // Optionally prune oldest entries if capacity exceeded
+                        if last_known.len() > LAST_KNOWN_CAPACITY {
+                            // remove least-recently-seen entries
+                            if let Some((&old_key, _)) = last_known.iter().min_by_key(|(_, (_, ts))| *ts) {
+                                last_known.remove(&old_key);
+                            }
+                        }
                     }
                 }
             }
@@ -268,7 +360,7 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
             // Clean up throttling tracking for logged out player
             player_last_sse_time.remove(&entity_id);
             
-            // Remove from player tracking
+                // Remove from player tracking but keep last-known in case they sign back in soon
             if let Some(player_group) = state.player.get(&1) {
                 let mut nodes = player_group.nodes.write().await;
                 let mut player_names = player_group.player_names.write().await;

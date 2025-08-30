@@ -47,6 +47,7 @@ pub struct AppConfig {
 pub struct EntityGroup {
     pub nodes: RwLock<HashMap<u64, [i32; 2]>>,
     pub player_names: RwLock<HashMap<u64, String>>, // Track player names by entity_id
+    pub last_known_names: RwLock<HashMap<u64, (String, u64)>>, // (name, last-seen ms)
     pub properties: Value,
 }
 
@@ -104,6 +105,7 @@ impl AppConfig {
             state.resource.insert(id, EntityGroup { 
                 nodes: RwLock::new(HashMap::new()), 
                 player_names: RwLock::new(HashMap::new()),
+                last_known_names: RwLock::new(HashMap::new()),
                 properties 
             });
         }
@@ -111,6 +113,7 @@ impl AppConfig {
             state.enemy.insert(id, EntityGroup { 
                 nodes: RwLock::new(HashMap::new()), 
                 player_names: RwLock::new(HashMap::new()),
+                last_known_names: RwLock::new(HashMap::new()),
                 properties 
             });
         }
@@ -118,6 +121,7 @@ impl AppConfig {
             state.player.insert(id, EntityGroup { 
                 nodes: RwLock::new(HashMap::new()), 
                 player_names: RwLock::new(HashMap::new()),
+                last_known_names: RwLock::new(HashMap::new()),
                 properties 
             });
         }
