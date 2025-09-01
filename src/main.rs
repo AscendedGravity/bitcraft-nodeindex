@@ -46,6 +46,11 @@ async fn main() {
     if !state.enemy.is_empty() { queries.push(Query::ENEMY) }
     for id in state.resource.keys() { queries.push(Query::RESOURCE(*id)) }
     if !state.player.is_empty() { queries.push(Query::PLAYER) }
+    // Config-based chat subscription activation
+    if state.chat.config.enabled {
+        queries.push(Query::CHAT);
+        info!("Chat subscription enabled via config");
+    }
 
     // Create SSE manager with default configuration
     let sse_manager = SseManager::default();
@@ -101,6 +106,9 @@ async fn server(rx: oneshot::Receiver<()>, config: ServerConfig, state: Arc<AppS
         .route("/resources", get(route_resources))
         .route("/enemies", get(route_enemies))
         .route("/players", get(route_players))
+    // Chat endpoints
+    .route("/chat/recent", get(route_chat_recent))
+    .route("/chat/channels", get(route_chat_channels))
         .merge(create_sse_router())  // Add SSE routes via the SSE module
         .layer(CompressionLayer::new().gzip(true).zstd(true))
         .with_state(state);
@@ -270,5 +278,58 @@ async fn route_health() -> Json<Value> {
     Json(serde_json::json!({
         "status": "ok",
         "timestamp": chrono::Utc::now().to_rfc3339()
+    }))
+}
+
+// === Chat API Endpoints ===
+async fn route_chat_recent(
+    state: State<Arc<AppStateWithSse<AppState>>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if !state.app_state.chat.config.enabled {
+        return Err((StatusCode::NOT_FOUND, "Chat tracking is disabled".to_string()));
+    }
+
+    // If configured not to serve the recent buffer, return an empty collection.
+    // This avoids returning a large batch of potentially outdated messages on initial load.
+    if !state.app_state.chat.config.serve_recent_on_fetch {
+        return Ok(Json(serde_json::json!({
+            "type": "ChatCollection",
+            "messages": [],
+            "count": 0,
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        })));
+    }
+
+    let recent = state.app_state.chat.recent_messages.read().await;
+    let mut messages: Vec<&crate::config::ChatMessage> = recent.iter().collect();
+    
+    // Ensure messages are sorted by timestamp descending (most recent first)
+    // The buffer should already be sorted, but this ensures correct order for the API
+    messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    Ok(Json(serde_json::json!({
+        "type": "ChatCollection",
+        "messages": messages,
+        "count": messages.len(),
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    })))
+}
+
+async fn route_chat_channels(
+    state: State<Arc<AppStateWithSse<AppState>>>,
+) -> Json<Value> {
+    Json(serde_json::json!({
+        "channels": [
+            {"id": 2, "name": "Empire Internal", "description": "Private empire communication"},
+            {"id": 3, "name": "Region", "description": "Regional chat"},
+            {"id": 4, "name": "Claim", "description": "Claim-specific chat"},
+            {"id": 5, "name": "Empire Public", "description": "Public empire communication"}
+        ],
+    "enabled": state.app_state.chat.config.enabled,
+    "configured_channels": state.app_state.chat.config.channels,
+    // Expose whether the server will serve recent messages on a fetch.
+    // Clients should open an SSE connection if this is false so they still
+    // receive live chat messages.
+    "serve_recent_on_fetch": state.app_state.chat.config.serve_recent_on_fetch
     }))
 }

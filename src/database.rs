@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bindings::region::DbUpdate;
 use hashbrown::{HashMap, HashSet};
 use tokio::sync::mpsc::UnboundedReceiver;
-use crate::config::AppState;
+use crate::config::{AppState, ChatMessage};
 use crate::sse::{SseManager, SseMessageProcessor};
 
 struct Update {
@@ -62,6 +62,20 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
     // TTL configuration for shared last-known names in `AppState`
     const LAST_KNOWN_TTL_MS: u64 = 7 * 24 * 3_600_000; // 7 days (much longer for better player experience)
     const LAST_KNOWN_CAPACITY: usize = 10_000; // higher capacity for popular servers
+
+    // Chat throttling
+    let mut last_chat_event_time: u64 = 0;
+    let chat_throttle_ms = state.chat.config.throttle_ms;
+
+    // Throttling helper function
+    fn is_throttled(last_event_time: &mut u64, throttle_ms: u64, now: u64) -> bool {
+        if now.saturating_sub(*last_event_time) < throttle_ms {
+            true
+        } else {
+            *last_event_time = now;
+            false
+        }
+    }
 
     while let Some(update) = rx.recv().await {
         // location_state should always be inserted in the batch the corresponding entity
@@ -172,6 +186,27 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
             map.reserve(updates.additional());
             for e_id in updates.delete { map.remove(&e_id); }
             for (e_id, loc) in updates.insert { map.insert(e_id, loc); }
+        }
+
+    // === Claim & Empire name cache updates for chat context ===
+        // Process claim state updates for chat context
+        for e in update.claim_state.inserts {
+            let mut claim_names = state.chat.claim_names.write().await;
+            claim_names.insert(e.row.entity_id, e.row.name.clone());
+        }
+        for e in update.claim_state.deletes {
+            let mut claim_names = state.chat.claim_names.write().await;
+            claim_names.remove(&e.row.entity_id);
+        }
+
+        // Process empire state updates for chat context
+        for e in update.empire_state.inserts {
+            let mut empire_names = state.chat.empire_names.write().await;
+            empire_names.insert(e.row.entity_id, e.row.name.clone());
+        }
+        for e in update.empire_state.deletes {
+            let mut empire_names = state.chat.empire_names.write().await;
+            empire_names.remove(&e.row.entity_id);
         }
 
         // Process player-related updates using correct table names
@@ -406,6 +441,91 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
                     tracing::debug!("event_buffer: CLEANUP COMPLETE expired={} remaining={}", expired_count, pending_login_events.len());
                 }
                 last_buffer_cleanup = current_time;
+            }
+        }
+
+    // === Chat message processing ===
+        if state.chat.config.enabled {
+            for e in update.chat_message_state.inserts {
+                // Filter channels if configured
+                if !state.chat.config.channels.is_empty() && !state.chat.config.channels.contains(&e.row.channel_id) {
+                    continue;
+                }
+
+                // Determine channel name & context lookup
+                let (channel_name, context_lookup) = match e.row.channel_id {
+                    2 => ("Empire Internal".to_string(), {
+                        let empire_names = state.chat.empire_names.read().await;
+                        empire_names.get(&e.row.target_id).cloned()
+                    }),
+                    3 => ("Region".to_string(), None),
+                    4 => ("Claim".to_string(), {
+                        let claim_names = state.chat.claim_names.read().await;
+                        claim_names.get(&e.row.target_id).cloned()
+                    }),
+                    5 => ("Empire Public".to_string(), {
+                        let empire_names = state.chat.empire_names.read().await;
+                        empire_names.get(&e.row.target_id).cloned()
+                    }),
+                    other => (format!("Unknown ({})", other), None),
+                };
+
+                // NOTE: e.row.timestamp is i32; treat as seconds since epoch (adjust if spec differs)
+                let mut chat_message = ChatMessage {
+                    entity_id: e.row.entity_id,
+                    channel_id: e.row.channel_id,
+                    channel_name: channel_name.clone(),
+                    target_id: e.row.target_id,
+                    username: e.row.username.clone(),
+                    text: e.row.text.clone(),
+                    timestamp: e.row.timestamp as i64,
+                    context: if state.chat.config.include_context { context_lookup } else { None },
+                };
+
+                // Truncate message if needed
+                if state.chat.config.max_message_length > 0 && chat_message.text.len() > state.chat.config.max_message_length {
+                    if state.chat.config.max_message_length > 3 { // ensure room for ellipsis
+                        chat_message.text.truncate(state.chat.config.max_message_length - 3);
+                        chat_message.text.push_str("...");
+                    } else {
+                        chat_message.text.truncate(state.chat.config.max_message_length);
+                    }
+                }
+
+                // Store in timestamp-ordered recent buffer (capacity 100)
+                // Keep messages sorted by timestamp and only retain the most recent 100
+                {
+                    let mut recent = state.chat.recent_messages.write().await;
+                    
+                    // Insert message in timestamp-sorted order
+                    let insert_pos = recent.binary_search_by_key(&chat_message.timestamp, |msg| msg.timestamp)
+                        .unwrap_or_else(|pos| pos);
+                    recent.insert(insert_pos, chat_message.clone());
+                    
+                    // Trim to keep only the most recent 100 messages by timestamp
+                    if recent.len() > 100 {
+                        // Remove the oldest messages (lowest timestamps)
+                        let excess = recent.len() - 100;
+                        for _ in 0..excess {
+                            recent.pop_front();
+                        }
+                    }
+                    
+                    tracing::debug!("chat_message_state.insert: stored message with timestamp {} in buffer (size: {})", 
+                                   chat_message.timestamp, recent.len());
+                }
+
+                // Throttle check using helper function
+                let current_time = now_ms();
+                if is_throttled(&mut last_chat_event_time, chat_throttle_ms, current_time) {
+                    continue;
+                }
+
+                if let Err(err) = sse_processor.process_chat_message(&chat_message, || true) {
+                    tracing::warn!("Failed to send chat SSE event: {:?}", err);
+                } else {
+                    tracing::debug!("chat_message_state.insert: CHAT SSE SENT channel={} user={} text={}", chat_message.channel_name, chat_message.username, chat_message.text);
+                }
             }
         }
     }

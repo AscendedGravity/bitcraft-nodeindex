@@ -6,6 +6,7 @@ pub enum Query {
     ENEMY,
     RESOURCE(i32),
     PLAYER,
+    CHAT, 
 }
 
 impl Query {
@@ -33,7 +34,14 @@ impl Query {
                 "SELECT loc.* FROM mobile_entity_state loc;".to_string(),
                 "SELECT sip.* FROM signed_in_player_state sip;".to_string(),
                 "SELECT pus.* FROM player_username_state pus;".to_string(),
-            ]
+            ],
+            Query::CHAT => vec![
+                // Chat messages (filter out system channels 0-2; >2 covers public/claim/region etc.)
+                "SELECT * FROM chat_message_state WHERE channel_id > 2;".to_string(),
+                // Supporting tables for context resolution (names)
+                "SELECT * FROM claim_state;".to_string(),
+                "SELECT * FROM empire_state;".to_string(),
+            ],
         }
     }
 }

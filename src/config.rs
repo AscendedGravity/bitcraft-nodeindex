@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::Path, sync::Arc};
+use std::{net::SocketAddr, path::Path, sync::Arc, collections::VecDeque};
 use bindings::sdk::{DbConnectionBuilder, __codegen::SpacetimeModule};
 use anyhow::{anyhow, Result};
 use hashbrown::HashMap;
@@ -42,9 +42,72 @@ pub struct ServerConfig {
 pub struct AppConfig {
     pub db: DbConfig,
     pub server: ServerConfig,
+    #[serde(default)]
+    pub chat: ChatConfig,
     pub resources: Vec<Entity>,
     pub enemies: Vec<Entity>,
     pub players: Vec<Entity>,
+}
+
+// === Chat Configuration & State ===
+
+fn default_chat_enabled() -> bool { false }
+fn default_chat_channels() -> Vec<i32> { vec![3, 4, 5] } // Region, Claim, (Reserved/Other)
+fn default_chat_include_context() -> bool { true }
+fn default_chat_max_length() -> usize { 500 }
+fn default_chat_throttle_ms() -> u64 { 100 }
+fn default_chat_serve_recent() -> bool { true }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatConfig {
+    #[serde(default = "default_chat_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_chat_channels")]
+    pub channels: Vec<i32>,
+    #[serde(default = "default_chat_include_context")]
+    pub include_context: bool,
+    #[serde(default = "default_chat_max_length")]
+    pub max_message_length: usize,
+    #[serde(default = "default_chat_throttle_ms")]
+    pub throttle_ms: u64,
+    /// When true the `/chat/recent` endpoint will return the buffered recent messages.
+    /// When false the endpoint will return an empty collection and clients should wait for SSE.
+    #[serde(default = "default_chat_serve_recent")]
+    pub serve_recent_on_fetch: bool,
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_chat_enabled(),
+            channels: default_chat_channels(),
+            include_context: default_chat_include_context(),
+            max_message_length: default_chat_max_length(),
+            throttle_ms: default_chat_throttle_ms(),
+            serve_recent_on_fetch: default_chat_serve_recent(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub entity_id: u64,
+    pub channel_id: i32,
+    pub channel_name: String,
+    pub target_id: u64,
+    pub username: String,
+    pub text: String,
+    pub timestamp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct ChatState {
+    pub config: ChatConfig,
+    pub recent_messages: Arc<RwLock<VecDeque<ChatMessage>>>,
+    pub claim_names: Arc<RwLock<HashMap<u64, String>>>,
+    pub empire_names: Arc<RwLock<HashMap<u64, String>>>,
 }
 
 pub struct EntityGroup {
@@ -61,6 +124,7 @@ pub struct AppState {
     pub resources_list: Vec<Entity>,
     pub enemies_list: Vec<Entity>,
     pub players_list: Vec<Entity>,
+    pub chat: ChatState,
 }
 
 
@@ -105,6 +169,12 @@ impl AppConfig {
             resources_list: self.resources.clone(),
             enemies_list: self.enemies.clone(),
             players_list: self.players.clone(),
+            chat: ChatState {
+                config: self.chat.clone(),
+                recent_messages: Arc::new(RwLock::new(VecDeque::with_capacity(100))),
+                claim_names: Arc::new(RwLock::new(HashMap::new())),
+                empire_names: Arc::new(RwLock::new(HashMap::new())),
+            },
         };
 
         for Entity { id, name: _, properties } in self.resources {

@@ -5,6 +5,14 @@
     "cors_origin": "http://127.0.0.1:8000",
     "logging_level": "info"
   },
+  "chat": {
+    "enabled": true,
+    "channels": [3, 4, 5],
+    "serve_recent_on_fetch": true,
+    "include_context": true,
+    "max_message_length": 500,
+    "throttle_ms": 100
+  },
   "resources": [
     { "id":        102, "name": "White Lily" },
     { "id":   70663203, "name": "Tier 10 Boulder" },

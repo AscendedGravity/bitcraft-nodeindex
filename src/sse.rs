@@ -11,6 +11,8 @@ use axum::{
 use tokio_stream::{wrappers::BroadcastStream, StreamExt, Stream};
 use std::sync::Arc;
 
+use crate::config::ChatMessage;
+
 /// Configuration for SSE functionality
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SseConfig {
@@ -69,6 +71,8 @@ impl SseEvent {
 pub enum SseError {
     #[error("Channel send failed: {0}")]
     ChannelSend(#[from] broadcast::error::SendError<SseEvent>),
+    #[error("Failed to serialize chat message: {0}")]
+    Serialization(String),
 }
 
 /// Core SSE manager for handling event broadcasting
@@ -156,6 +160,26 @@ impl SseManager {
         if self.config.verbose_logging {
             eprintln!("SSE Error during {}: {:?}", operation, error);
         }
+    }
+
+    // === Chat-specific helpers ===
+
+    /// Send a structured chat message event (event type: chat_message)
+    pub fn send_chat_message(&self, message: &ChatMessage) -> Result<bool, SseError> {
+        let event_data = serde_json::to_string(message)
+            .map_err(|e| SseError::Serialization(e.to_string()))?;
+        let event = SseEvent { message: event_data, event_type: Some("chat_message".to_string()) };
+        self.send_event_if_subscribers(event)
+    }
+
+    /// Send a simplified formatted chat event (event type: chat) => "[Context] Username: Message"
+    pub fn send_chat_event_formatted(&self, username: &str, text: &str, channel: &str, context: Option<&str>) -> Result<bool, SseError> {
+        let formatted_message = match context {
+            Some(ctx) => format!("[{}] {}: {}", ctx, username, text),
+            None => format!("[{}] {}: {}", channel, username, text),
+        };
+        let event = SseEvent { message: formatted_message, event_type: Some("chat".to_string()) };
+        self.send_event_if_subscribers(event)
     }
 }
 
@@ -277,6 +301,26 @@ impl SseMessageProcessor {
             }
         }
     }
+
+    /// Process a chat message with optional throttling predicate
+    pub fn process_chat_message(&self, message: &ChatMessage, throttle_check: impl Fn() -> bool) -> Result<(), SseError> {
+        if !throttle_check() {
+            return Ok(()); // throttled, silently skip
+        }
+        match self.manager.send_chat_message(message) {
+            Ok(true) => {
+                if self.manager.config.verbose_logging {
+                    println!("SSE: Chat message event sent (channel={} user={} text={})", message.channel_name, message.username, message.text);
+                }
+                Ok(())
+            }
+            Ok(false) => Ok(()),
+            Err(e) => {
+                self.manager.log_error("chat message", &e);
+                Err(e)
+            }
+        }
+    }
 }
 
 // === HTTP Route Integration ===
@@ -330,6 +374,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::{timeout, Duration as TokioDuration};
     
     #[test]
     fn test_sse_config_default() {
@@ -422,5 +467,62 @@ mod tests {
         let manager = SseManager::default();
         let _processor = SseMessageProcessor::new(manager);
         // Test that the processor can be created successfully
+    }
+
+    #[tokio::test]
+    async fn test_chat_event_methods() {
+        let manager = SseManager::default();
+        let mut rx = manager.subscribe();
+
+        let chat_msg = ChatMessage {
+            entity_id: 1,
+            channel_id: 3,
+            channel_name: "Region".to_string(),
+            target_id: 42,
+            username: "Tester".to_string(),
+            text: "Hello".to_string(),
+            timestamp: 0,
+            context: Some("EmpireName".to_string()),
+        };
+
+        // Structured event
+        let sent = manager.send_chat_message(&chat_msg).unwrap();
+        assert!(sent);
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.event_type.unwrap(), "chat_message");
+
+        // Formatted event
+        let sent2 = manager.send_chat_event_formatted(&chat_msg.username, &chat_msg.text, &chat_msg.channel_name, chat_msg.context.as_deref()).unwrap();
+        assert!(sent2);
+        let event2 = rx.recv().await.unwrap();
+        assert_eq!(event2.event_type.unwrap(), "chat");
+    }
+
+    #[tokio::test]
+    async fn test_chat_message_throttled_behavior() {
+        let manager = SseManager::default();
+        let mut rx = manager.subscribe();
+        let processor = SseMessageProcessor::new(manager.clone());
+
+        let chat_msg = ChatMessage {
+            entity_id: 1,
+            channel_id: 3,
+            channel_name: "Region".to_string(),
+            target_id: 0,
+            username: "Tester".to_string(),
+            text: "Hello".to_string(),
+            timestamp: 0,
+            context: None,
+        };
+
+        // First send allowed
+        processor.process_chat_message(&chat_msg, || true).unwrap();
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.event_type.unwrap(), "chat_message");
+
+        // Second send throttled (closure returns false)
+        processor.process_chat_message(&chat_msg, || false).unwrap();
+        let second = timeout(TokioDuration::from_millis(150), rx.recv()).await;
+        assert!(second.is_err(), "Expected no second event due to throttling simulation");
     }
 }
