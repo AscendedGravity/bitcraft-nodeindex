@@ -271,7 +271,68 @@ async fn route_enemies(
 async fn route_players(
     state: State<Arc<AppStateWithSse<AppState>>>,
 ) -> Json<Value> {
-    Json(serde_json::json!(state.app_state.players_list))
+    // Instead of returning static config list, return aggregated live player data
+    // This prevents duplicate entity IDs between /players and /player/{id} endpoints
+    
+    let mut all_features = Vec::new();
+    
+    // Collect live player data from all configured player groups
+    for (player_id, player_group) in &state.app_state.player {
+        let nodes = player_group.nodes.read().await;
+        let player_names = player_group.player_names.read().await;
+        
+        // Create individual Point features with entity IDs and player names
+        for (entity_id, coords) in nodes.iter() {
+            // Resolve player name (same logic as route_player_id)
+            let player_name = match player_names.get(entity_id) {
+                Some(name) => name.clone(),
+                None => {
+                    // Try shared last_known_names
+                    let mut restored: Option<String> = None;
+                    if let Some(player_group_1) = state.app_state.player.get(&1) {
+                        if let Ok(mut last_known) = player_group_1.last_known_names.try_write() {
+                            if let Some((name, ts)) = last_known.get_mut(entity_id) {
+                                *ts = chrono::Utc::now().timestamp_millis() as u64;
+                                restored = Some(name.clone());
+                            }
+                        } else {
+                            let last_known = player_group_1.last_known_names.blocking_read();
+                            if let Some((name, _)) = last_known.get(entity_id) {
+                                restored = Some(name.clone());
+                            }
+                        }
+                    }
+                    
+                    restored.unwrap_or_else(|| format!("Player_{}", entity_id))
+                }
+            };
+            
+            all_features.push(serde_json::json!({
+                "type": "Feature",
+                "properties": {
+                    "entity_id": entity_id,
+                    "player_name": player_name,
+                    "player_group_id": player_id, // Include which group this came from
+                    "makeCanvas": player_group.properties.get("makeCanvas").unwrap_or(&serde_json::json!("10"))
+                },
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [coords[0] as f64 / 1_000f64, coords[1] as f64 / 1_000f64]
+                }
+            }));
+        }
+    }
+    
+    Json(serde_json::json!({
+        "type": "FeatureCollection",
+        "features": all_features,
+        "metadata": {
+            "endpoint": "players",
+            "aggregated": true,
+            "player_groups": state.app_state.player.keys().collect::<Vec<_>>(),
+            "feature_count": all_features.len()
+        }
+    }))
 }
 
 async fn route_health() -> Json<Value> {
