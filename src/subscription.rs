@@ -7,6 +7,7 @@ pub enum Query {
     RESOURCE(i32),
     PLAYER,
     CHAT, 
+    DUNGEONS,
 }
 
 impl Query {
@@ -41,6 +42,12 @@ impl Query {
                 // Supporting tables for context resolution (names)
                 "SELECT * FROM claim_state;".to_string(),
                 "SELECT * FROM empire_state;".to_string(),
+            ],
+            Query::DUNGEONS => vec![
+                // Portal states - subscribe to all portal_state entries to track enabled/disabled changes
+                "SELECT * FROM portal_state;".to_string(),
+                // Location data for portal positions  
+                "SELECT loc.* FROM location_state loc JOIN portal_state ps ON loc.entity_id = ps.entity_id;".to_string(),
             ],
         }
     }

@@ -188,6 +188,60 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
             for (e_id, loc) in updates.insert { map.insert(e_id, loc); }
         }
 
+        // Process portal state updates for dungeons tracking
+        for e in update.portal_state.inserts {
+            tracing::debug!("portal_state.insert: Processing portal entity_id={} enabled={}", e.row.entity_id, e.row.enabled);
+            
+            // Check if this portal entity_id matches any of our tracked dungeon type IDs
+            if let Some(dungeon_entry) = state.dungeons_list.iter().find(|d| d.id == e.row.entity_id) {
+                // This portal matches a configured dungeon type - process it
+                if let Some(dungeon_group) = state.dungeon.get(&e.row.entity_id) {
+                    let mut nodes = dungeon_group.nodes.write().await;
+                    
+                    // Portal enabled means active - enabled=true means portal is active
+                    if e.row.enabled {
+                        // Portal is enabled/active - add to tracking
+                        // Location coordinates are in the portal_state row as destination_x/destination_z
+                        let loc = [e.row.destination_x, e.row.destination_z];
+                        nodes.insert(e.row.entity_id, loc);
+                        tracing::info!("portal_state.insert: PORTAL ENABLED entity_id={} dungeon_type={} location=[{}, {}]", 
+                                     e.row.entity_id, e.row.entity_id, loc[0], loc[1]);
+                        
+                        // Send SSE event for portal state change (enabled)
+                        let _ = sse_processor.process_portal_state_change_with_dungeon(
+                            e.row.entity_id, e.row.entity_id, true, Some(loc[0]), Some(loc[1])
+                        );
+                        
+                        // Also send the original dungeon insert event for backwards compatibility
+                        let _ = sse_processor.process_dungeon_insert(e.row.entity_id, e.row.entity_id, loc[0], loc[1]);
+                    } else {
+                        // Portal is disabled - remove from tracking
+                        if nodes.remove(&e.row.entity_id).is_some() {
+                            tracing::info!("portal_state.insert: PORTAL DISABLED entity_id={} dungeon_type={} (removed from tracking)", 
+                                         e.row.entity_id, e.row.entity_id);
+                            
+                            // Send SSE event for portal state change (disabled)
+                            let _ = sse_processor.process_portal_state_change_with_dungeon(
+                                e.row.entity_id, e.row.entity_id, false, None, None
+                            );
+                            
+                            // Also send the original dungeon delete event for backwards compatibility
+                            let _ = sse_processor.process_dungeon_delete(e.row.entity_id, e.row.entity_id);
+                        } else {
+                            tracing::debug!("portal_state.insert: PORTAL DISABLED entity_id={} but was not being tracked", e.row.entity_id);
+                        }
+                    }
+                } else {
+                    tracing::warn!("portal_state.insert: Dungeon group not found for entity_id={}", e.row.entity_id);
+                }
+            } else {
+                tracing::debug!("portal_state.insert: Portal entity_id={} not in dungeon config", e.row.entity_id);
+            }
+        }
+
+        // NOTE: We only process portal_state inserts, not deletes
+        // Portal state changes are reflected in insert events with enabled flag changes
+
     // === Claim & Empire name cache updates for chat context ===
         // Process claim state updates for chat context
         for e in update.claim_state.inserts {

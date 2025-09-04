@@ -1,15 +1,13 @@
-use std::{net::SocketAddr, path::Path, sync::Arc, collections::VecDeque};
-use bindings::sdk::{DbConnectionBuilder, __codegen::SpacetimeModule};
-use anyhow::{anyhow, Result};
-use hashbrown::HashMap;
-use serde::{Serialize, Deserialize};
-use serde_json::{json, Value};
+use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::RwLock;
-
-fn default_properties() -> Value { json!({ "makeCanvas": "10" }) }
-fn default_socket_addr() -> SocketAddr { SocketAddr::from(([0, 0, 0, 0], 3000)) }
-fn default_logging_level() -> String { "info".to_string() }
-
+use serde::{Serialize, Deserialize};
+use serde_json::{Value, json};
+use std::collections::VecDeque;
+use anyhow::{Result, anyhow};
+use std::path::Path;
+use bindings::sdk::{DbConnectionBuilder, __codegen::SpacetimeModule};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Entity {
@@ -20,12 +18,24 @@ pub struct Entity {
     pub properties: Value,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct DungeonEntity {
+    pub id: u64,
+    #[serde(default = "Default::default")]
+    pub name: String,
+    #[serde(default = "default_properties")]
+    pub properties: Value,
+}
+
+fn default_properties() -> Value { json!({ "makeCanvas": "10" }) }
+fn default_socket_addr() -> SocketAddr { ([127, 0, 0, 1], 3300).into() }
+fn default_logging_level() -> String { "info".to_string() }
+
 #[derive(Serialize, Deserialize)]
 pub struct DbConfig {
     #[serde(default = "Default::default")]
-    pub region: u8,
-    #[serde(default = "Default::default")]
     pub token: String,
+    pub region: i32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -47,6 +57,8 @@ pub struct AppConfig {
     pub resources: Vec<Entity>,
     pub enemies: Vec<Entity>,
     pub players: Vec<Entity>,
+    #[serde(default)]
+    pub dungeons: Vec<DungeonEntity>,
 }
 
 // === Chat Configuration & State ===
@@ -121,9 +133,11 @@ pub struct AppState {
     pub resource: HashMap<i32, EntityGroup>,
     pub enemy: HashMap<i32, EntityGroup>,
     pub player: HashMap<i32, EntityGroup>,
+    pub dungeon: HashMap<u64, EntityGroup>,
     pub resources_list: Vec<Entity>,
     pub enemies_list: Vec<Entity>,
     pub players_list: Vec<Entity>,
+    pub dungeons_list: Vec<DungeonEntity>,
     pub chat: ChatState,
 }
 
@@ -166,9 +180,11 @@ impl AppConfig {
             resource: HashMap::with_capacity(self.resources.len()),
             enemy: HashMap::with_capacity(self.enemies.len()),
             player: HashMap::with_capacity(self.players.len()),
+            dungeon: HashMap::with_capacity(self.dungeons.len()),
             resources_list: self.resources.clone(),
             enemies_list: self.enemies.clone(),
             players_list: self.players.clone(),
+            dungeons_list: self.dungeons.clone(),
             chat: ChatState {
                 config: self.chat.clone(),
                 recent_messages: Arc::new(RwLock::new(VecDeque::with_capacity(100))),
@@ -195,6 +211,14 @@ impl AppConfig {
         }
         for Entity { id, name: _, properties } in self.players {
             state.player.insert(id, EntityGroup { 
+                nodes: RwLock::new(HashMap::new()), 
+                player_names: RwLock::new(HashMap::new()),
+                last_known_names: RwLock::new(HashMap::new()),
+                properties 
+            });
+        }
+        for DungeonEntity { id, name: _, properties } in self.dungeons {
+            state.dungeon.insert(id, EntityGroup { 
                 nodes: RwLock::new(HashMap::new()), 
                 player_names: RwLock::new(HashMap::new()),
                 last_known_names: RwLock::new(HashMap::new()),

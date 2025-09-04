@@ -46,6 +46,7 @@ async fn main() {
     if !state.enemy.is_empty() { queries.push(Query::ENEMY) }
     for id in state.resource.keys() { queries.push(Query::RESOURCE(*id)) }
     if !state.player.is_empty() { queries.push(Query::PLAYER) }
+    if !state.dungeon.is_empty() { queries.push(Query::DUNGEONS) }
     // Config-based chat subscription activation
     if state.chat.config.enabled {
         queries.push(Query::CHAT);
@@ -102,10 +103,12 @@ async fn server(rx: oneshot::Receiver<()>, config: ServerConfig, state: Arc<AppS
         .route("/resource/{id}", get(route_resource_id))
         .route("/enemy/{id}", get(route_enemy_id))
         .route("/player/{id}", get(route_player_id))
+        .route("/dungeon/{id}", get(route_dungeon_id))
         .route("/health", get(route_health))
         .route("/resources", get(route_resources))
         .route("/enemies", get(route_enemies))
         .route("/players", get(route_players))
+        .route("/dungeons", get(route_dungeons))
     // Chat endpoints
     .route("/chat/recent", get(route_chat_recent))
     .route("/chat/channels", get(route_chat_channels))
@@ -393,4 +396,44 @@ async fn route_chat_channels(
     // receive live chat messages.
     "serve_recent_on_fetch": state.app_state.chat.config.serve_recent_on_fetch
     }))
+}
+
+async fn route_dungeon_id(
+    Path(id): Path<u64>,
+    state: State<Arc<AppStateWithSse<AppState>>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let Some(dungeon) = state.app_state.dungeon.get(&id) else {
+        return Err((StatusCode::NOT_FOUND, format!("Dungeon ID not found: {}", id)))
+    };
+    let nodes = dungeon.nodes.read().await;
+
+    // Create individual Point features with entity IDs and portal states in properties
+    let features: Vec<serde_json::Value> = nodes
+        .iter()
+        .map(|(entity_id, coords)| {
+            serde_json::json!({
+                "type": "Feature",
+                "properties": {
+                    "entity_id": entity_id,
+                    "makeCanvas": dungeon.properties.get("makeCanvas").unwrap_or(&serde_json::json!("10")),
+                    "dungeon_type": id
+                },
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [coords[0] as f64 / 1_000f64, coords[1] as f64 / 1_000f64]
+                }
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "type": "FeatureCollection",
+        "features": features
+    })))
+}
+
+async fn route_dungeons(
+    state: State<Arc<AppStateWithSse<AppState>>>,
+) -> Json<Value> {
+    Json(serde_json::json!(state.app_state.dungeons_list))
 }
