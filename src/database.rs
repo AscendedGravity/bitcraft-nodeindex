@@ -193,7 +193,7 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
             tracing::debug!("portal_state.insert: Processing portal entity_id={} enabled={}", e.row.entity_id, e.row.enabled);
             
             // Check if this portal entity_id matches any of our tracked dungeon type IDs
-            if let Some(dungeon_entry) = state.dungeons_list.iter().find(|d| d.id == e.row.entity_id) {
+            if let Some(_dungeon_entry) = state.dungeons_list.iter().find(|d| d.id == e.row.entity_id) {
                 // This portal matches a configured dungeon type - process it
                 if let Some(dungeon_group) = state.dungeon.get(&e.row.entity_id) {
                     let mut nodes = dungeon_group.nodes.write().await;

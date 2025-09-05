@@ -136,7 +136,6 @@ pub struct AppState {
     pub dungeon: HashMap<u64, EntityGroup>,
     pub resources_list: Vec<Entity>,
     pub enemies_list: Vec<Entity>,
-    pub players_list: Vec<Entity>,
     pub dungeons_list: Vec<DungeonEntity>,
     pub chat: ChatState,
 }
@@ -183,7 +182,6 @@ impl AppConfig {
             dungeon: HashMap::with_capacity(self.dungeons.len()),
             resources_list: self.resources.clone(),
             enemies_list: self.enemies.clone(),
-            players_list: self.players.clone(),
             dungeons_list: self.dungeons.clone(),
             chat: ChatState {
                 config: self.chat.clone(),
