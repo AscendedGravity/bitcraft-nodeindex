@@ -340,5 +340,10 @@
   ],
   "players": [
     { "id": 1, "name": "All Players" }
+  ],
+  "dungeons": [
+    { "id": 576460752417259567, "name": "Goat Island" },
+    { "id": 576460752417271665, "name": "Albern" },
+    { "id": 576460752417284631, "name": "Lezzys" }
   ]
 }

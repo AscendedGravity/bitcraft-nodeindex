@@ -435,5 +435,53 @@ async fn route_dungeon_id(
 async fn route_dungeons(
     state: State<Arc<AppStateWithSse<AppState>>>,
 ) -> Json<Value> {
-    Json(serde_json::json!(state.app_state.dungeons_list))
+    // Create enhanced dungeons list with portal state information
+    let mut dungeons_with_portal_state = Vec::new();
+    
+    for dungeon_config in &state.app_state.dungeons_list {
+        let mut dungeon_info = serde_json::json!({
+            "id": dungeon_config.id,
+            "name": dungeon_config.name,
+            "properties": dungeon_config.properties
+        });
+        
+        // Check if this dungeon has any active portals
+        if let Some(dungeon_group) = state.app_state.dungeon.get(&dungeon_config.id) {
+            let nodes = dungeon_group.nodes.read().await;
+            let active_portals: Vec<serde_json::Value> = nodes
+                .iter()
+                .map(|(entity_id, coords)| {
+                    serde_json::json!({
+                        "entity_id": entity_id,
+                        "coordinates": [coords[0] as f64 / 1_000f64, coords[1] as f64 / 1_000f64],
+                        "portal_active": true
+                    })
+                })
+                .collect();
+            
+            dungeon_info["portal_state"] = serde_json::json!({
+                "has_active_portals": !active_portals.is_empty(),
+                "active_portal_count": active_portals.len(),
+                "active_portals": active_portals
+            });
+        } else {
+            // No dungeon group found, no active portals
+            dungeon_info["portal_state"] = serde_json::json!({
+                "has_active_portals": false,
+                "active_portal_count": 0,
+                "active_portals": []
+            });
+        }
+        
+        dungeons_with_portal_state.push(dungeon_info);
+    }
+    
+    Json(serde_json::json!({
+        "dungeons": dungeons_with_portal_state,
+        "metadata": {
+            "endpoint": "dungeons",
+            "total_dungeons": dungeons_with_portal_state.len(),
+            "includes_portal_state": true
+        }
+    }))
 }
