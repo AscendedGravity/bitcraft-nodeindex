@@ -36,6 +36,16 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
     // Dungeon state tracking: entity_id -> DungeonState
     let mut dungeon_states: HashMap<u64, DungeonState> = HashMap::new();
     
+    // State stabilization for dimension network state
+    #[derive(Debug, Clone)]
+    struct PendingNetworkStateChange {
+        operations: Vec<(Option<DimensionNetworkState>, u64)>, // Vec of (network_state, timestamp)
+        first_seen: u64,
+        last_updated: u64,
+    }
+    let mut pending_network_changes: HashMap<u64, PendingNetworkStateChange> = HashMap::new();
+    const NETWORK_STATE_STABILIZATION_MS: u64 = 2500; // Wait 2.5 seconds for changes to stabilize
+    
     // Event buffering system for handling race conditions
     #[derive(Debug, Clone)]
     struct PendingLoginEvent {
@@ -255,89 +265,176 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
             let _ = sse_processor.process_dungeon_delete(entity_id, entity_id);
         }
         
-        // Process dimension_network_state updates (network lifecycle)
+        // Process dimension_network_state updates with stabilization (network lifecycle)
+        let current_time = now_ms();
+        
+        // Handle dimension_network_state inserts
         for e in update.dimension_network_state.inserts {
             let building_id = e.row.building_id;
-            tracing::debug!("dimension_network_state.insert: Processing building_id={} collapse_timestamp={} is_collapsed={}", 
-                           building_id, e.row.collapse_respawn_timestamp, e.row.is_collapsed);
-            
-            // Check if this relates to a tracked dungeon
-            if let Some(dungeon_state) = dungeon_states.get_mut(&building_id) {
-                let _old_derived_state = dungeon_state.derived_state.clone();
-                
-                // Create new network state
-                let network_state = DimensionNetworkState::new(
-                    e.row.collapse_respawn_timestamp,
-                    e.row.is_collapsed
-                );
-                
-                // Create network state JSON for SSE
-                let network_json = serde_json::json!({
-                    "collapse_respawn_timestamp": e.row.collapse_respawn_timestamp,
-                    "is_collapsed": e.row.is_collapsed
-                });
-                
-                // Update dungeon state and check for transitions
-                if let Some(transition) = dungeon_state.update_network_state(network_state.clone()) {
-                    tracing::info!("dimension_network_state.insert: STATE TRANSITION building_id={} {:?} -> {:?}", 
-                                 building_id, transition.from, transition.to);
-                    
-                    // Send transition SSE event
-                    let _ = sse_processor.process_dungeon_network_transition(
-                        building_id, 
-                        &format!("{:?}", transition.from).to_lowercase(), 
-                        &format!("{:?}", transition.to).to_lowercase(), 
-                        transition.at_timestamp
-                    );
-                    
-                    // Send network updated SSE event with derived_state
-                    let _ = sse_processor.process_dungeon_network_updated(
-                        building_id, 
-                        &network_json, 
-                        &format!("{:?}", dungeon_state.derived_state).to_lowercase()
-                    );
-                } else {
-                    tracing::debug!("dimension_network_state.insert: NO STATE CHANGE building_id={} state={:?}", 
-                                  building_id, dungeon_state.derived_state);
-                    
-                    // Send network updated SSE event (no transition but network data changed)
-                    let _ = sse_processor.process_dungeon_network_updated(
-                        building_id, 
-                        &network_json, 
-                        &format!("{:?}", dungeon_state.derived_state).to_lowercase()
-                    );
-                }
+            let current_timestamp = now_ms();
+            let time_until_collapse = if e.row.collapse_respawn_timestamp > 0 && e.row.collapse_respawn_timestamp > current_timestamp {
+                (e.row.collapse_respawn_timestamp - current_timestamp) / 1000 // seconds
             } else {
-                tracing::debug!("dimension_network_state.insert: No dungeon state found for building_id={}", building_id);
-            }
+                0
+            };
+            
+            tracing::info!("dimension_network_state.insert: building_id={} collapse_timestamp={} is_collapsed={} current_time={} time_until_collapse={}s", 
+                           building_id, e.row.collapse_respawn_timestamp, e.row.is_collapsed, current_timestamp, time_until_collapse);
+            
+            // Create new network state
+            let network_state = DimensionNetworkState::new(
+                e.row.collapse_respawn_timestamp,
+                e.row.is_collapsed
+            );
+            
+            // Log the derived state that will be computed
+            let derived_state = network_state.derived_state_at_time(current_timestamp);
+            tracing::info!("dimension_network_state.insert: building_id={} computed derived_state={:?}", building_id, derived_state);
+            
+            // Add to pending changes for stabilization (accumulate operations)
+            let pending = pending_network_changes.entry(building_id).or_insert_with(|| PendingNetworkStateChange {
+                operations: Vec::new(),
+                first_seen: current_time,
+                last_updated: current_time,
+            });
+            
+            pending.operations.push((Some(network_state), current_time));
+            pending.last_updated = current_time;
+            
+            tracing::debug!("dimension_network_state.insert: BUFFERED building_id={} (stabilizing for {}ms, total_ops={})", 
+                           building_id, NETWORK_STATE_STABILIZATION_MS, pending.operations.len());
         }
         
+        // Handle dimension_network_state deletes
         for e in update.dimension_network_state.deletes {
             let building_id = e.row.building_id;
-            tracing::info!("dimension_network_state.delete: REMOVING NETWORK STATE building_id={}", building_id);
+            tracing::debug!("dimension_network_state.delete: Processing building_id={}", building_id);
             
-            // Check if this relates to a tracked dungeon
-            if let Some(dungeon_state) = dungeon_states.get_mut(&building_id) {
-                if let Some(transition) = dungeon_state.clear_network_state() {
-                    tracing::info!("dimension_network_state.delete: STATE TRANSITION building_id={} {:?} -> {:?}", 
-                                 building_id, transition.from, transition.to);
-                    
-                    // Send transition SSE event
-                    let _ = sse_processor.process_dungeon_network_transition(
-                        building_id, 
-                        &format!("{:?}", transition.from).to_lowercase(), 
-                        &format!("{:?}", transition.to).to_lowercase(), 
-                        transition.at_timestamp
-                    );
-                    
-                    // Send network updated SSE event (cleared network state)
-                    let empty_network = serde_json::json!(null);
-                    let _ = sse_processor.process_dungeon_network_updated(
-                        building_id, 
-                        &empty_network, 
-                        &format!("{:?}", dungeon_state.derived_state).to_lowercase()
-                    );
+            // Add deletion to pending changes for stabilization (accumulate operations)
+            let pending = pending_network_changes.entry(building_id).or_insert_with(|| PendingNetworkStateChange {
+                operations: Vec::new(),
+                first_seen: current_time,
+                last_updated: current_time,
+            });
+            
+            pending.operations.push((None, current_time)); // None means deletion
+            pending.last_updated = current_time;
+            
+            tracing::debug!("dimension_network_state.delete: BUFFERED building_id={} (stabilizing for {}ms, total_ops={})", 
+                           building_id, NETWORK_STATE_STABILIZATION_MS, pending.operations.len());
+        }
+        
+        // Process stabilized network state changes
+        let mut changes_to_apply = Vec::new();
+        pending_network_changes.retain(|&building_id, pending| {
+            let age = current_time.saturating_sub(pending.first_seen);
+            if age >= NETWORK_STATE_STABILIZATION_MS {
+                // This change has stabilized - determine the final state
+                // Special logic for dimension network state: if we see an insert followed by immediate delete,
+                // preserve the inserted state (common pattern in SpacetimeDB for event-like data)
+                let mut final_state: Option<DimensionNetworkState> = None;
+                let mut has_any_insert = false;
+                
+                // Check if we have any insert operations
+                for (network_state, _timestamp) in &pending.operations {
+                    if network_state.is_some() {
+                        has_any_insert = true;
+                        final_state = network_state.clone();
+                        break; // Take the first insert we find
+                    }
                 }
+                
+                // If no inserts found, check for explicit deletes of existing state
+                if !has_any_insert {
+                    final_state = None;
+                }
+                
+                tracing::debug!("dimension_network_state.STABILIZE_ANALYSIS: building_id={} operations={} has_insert={} final_state={:?}", 
+                               building_id, pending.operations.len(), has_any_insert, 
+                               final_state.as_ref().map(|s| s.derived_state()));
+                
+                changes_to_apply.push((building_id, final_state));
+                false // Remove from pending
+            } else {
+                true // Keep in pending
+            }
+        });
+        
+        // Log pending buffer status if there are buffered changes
+        if !pending_network_changes.is_empty() && current_time % 5000 < 100 { // Log every ~5 seconds
+            tracing::debug!("dimension_network_state.BUFFER_STATUS: {} pending changes awaiting stabilization", 
+                           pending_network_changes.len());
+        }
+        
+        // Apply stabilized changes
+        for (building_id, final_network_state) in changes_to_apply {
+            if let Some(dungeon_state) = dungeon_states.get_mut(&building_id) {
+                match final_network_state {
+                    Some(network_state) => {
+                        // Apply network state insert/update
+                        let network_json = serde_json::json!({
+                            "collapse_respawn_timestamp": network_state.collapse_respawn_timestamp,
+                            "is_collapsed": network_state.is_collapsed
+                        });
+                        
+                        if let Some(transition) = dungeon_state.update_network_state(network_state.clone()) {
+                            tracing::info!("dimension_network_state.STABILIZED: STATE TRANSITION building_id={} {:?} -> {:?}", 
+                                         building_id, transition.from, transition.to);
+                            
+                            // Send transition SSE event
+                            let _ = sse_processor.process_dungeon_network_transition(
+                                building_id, 
+                                &format!("{:?}", transition.from).to_lowercase(), 
+                                &format!("{:?}", transition.to).to_lowercase(), 
+                                transition.at_timestamp
+                            );
+                            
+                            // Send network updated SSE event with derived_state
+                            let _ = sse_processor.process_dungeon_network_updated(
+                                building_id, 
+                                &network_json, 
+                                &format!("{:?}", dungeon_state.derived_state).to_lowercase()
+                            );
+                        } else {
+                            tracing::debug!("dimension_network_state.STABILIZED: NO STATE CHANGE building_id={} state={:?}", 
+                                          building_id, dungeon_state.derived_state);
+                            
+                            // Send network updated SSE event (no transition but network data changed)
+                            let _ = sse_processor.process_dungeon_network_updated(
+                                building_id, 
+                                &network_json, 
+                                &format!("{:?}", dungeon_state.derived_state).to_lowercase()
+                            );
+                        }
+                    }
+                    None => {
+                        // Apply network state deletion
+                        if let Some(transition) = dungeon_state.clear_network_state() {
+                            tracing::info!("dimension_network_state.STABILIZED: STATE TRANSITION building_id={} {:?} -> {:?}", 
+                                         building_id, transition.from, transition.to);
+                            
+                            // Send transition SSE event
+                            let _ = sse_processor.process_dungeon_network_transition(
+                                building_id, 
+                                &format!("{:?}", transition.from).to_lowercase(), 
+                                &format!("{:?}", transition.to).to_lowercase(), 
+                                transition.at_timestamp
+                            );
+                            
+                            // Send network updated SSE event (cleared network state)
+                            let empty_network = serde_json::json!(null);
+                            let _ = sse_processor.process_dungeon_network_updated(
+                                building_id, 
+                                &empty_network, 
+                                &format!("{:?}", dungeon_state.derived_state).to_lowercase()
+                            );
+                        } else {
+                            tracing::debug!("dimension_network_state.STABILIZED: NO STATE CHANGE ON DELETE building_id={}", building_id);
+                        }
+                    }
+                }
+            } else {
+                tracing::debug!("dimension_network_state.STABILIZED: No dungeon state found for building_id={}", building_id);
             }
         }
 

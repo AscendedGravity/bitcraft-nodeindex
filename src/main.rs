@@ -113,6 +113,7 @@ async fn server(rx: oneshot::Receiver<()>, config: ServerConfig, state: Arc<AppS
         .route("/enemies", get(route_enemies))
         .route("/players", get(route_players))
         .route("/dungeons", get(route_dungeons))
+        .route("/dungeons/tracked", get(route_dungeons_tracked))
     // Chat endpoints
     .route("/chat/recent", get(route_chat_recent))
     .route("/chat/channels", get(route_chat_channels))
@@ -411,10 +412,24 @@ async fn route_dungeon_id(
     };
     let nodes = dungeon.nodes.read().await;
 
-    // Check if we have any state information tracked through SSE events
-    let has_state_tracking = {
+    // Get current dungeon state information
+    let (has_state_tracking, current_derived_state, network_info) = {
         let dungeon_states_lock = state.dungeon_states.read().await;
-        dungeon_states_lock.contains_key(&id)
+        if let Some(dungeon_state) = dungeon_states_lock.get(&id) {
+            let network_info = if let Some(ref network_state) = dungeon_state.network_state {
+                serde_json::json!({
+                    "collapse_respawn_timestamp": network_state.collapse_respawn_timestamp,
+                    "is_collapsed": network_state.is_collapsed,
+                    "has_scheduled_collapse": network_state.collapse_respawn_timestamp > 0,
+                })
+            } else {
+                serde_json::json!(null)
+            };
+            
+            (true, format!("{:?}", dungeon_state.derived_state).to_lowercase(), network_info)
+        } else {
+            (false, "unknown".to_string(), serde_json::json!(null))
+        }
     };
 
     // Create individual Point features with entity IDs and enhanced properties
@@ -428,6 +443,8 @@ async fn route_dungeon_id(
                     "makeCanvas": dungeon.properties.get("makeCanvas").unwrap_or(&serde_json::json!("10")),
                     "dungeon_type": id,
                     "state_tracking": if has_state_tracking { "active" } else { "enabled" },
+                    "current_state": current_derived_state,
+                    "network_state": network_info.clone(),
                     "sse_events": "dungeon.* events available"
                 },
                 "geometry": {
@@ -444,8 +461,10 @@ async fn route_dungeon_id(
         "metadata": {
             "dungeon_id": id,
             "state_tracking": if has_state_tracking { "active - dungeon state being tracked" } else { "enabled - awaiting first state event" },
+            "current_state": current_derived_state,
+            "network_state": network_info,
             "sse_support": "dungeon.* events available via /sse/events/dungeons",
-            "derived_states": ["Open", "Cleared", "Closed"]
+            "derived_states": ["open", "cleared", "closed"]
         }
     });
 
@@ -471,17 +490,35 @@ async fn route_dungeons(
             "properties": dungeon_config.properties
         });
         
-        // Check if this specific dungeon is being tracked
-        let is_tracked = {
+        // Get current dungeon state information
+        let (is_tracked, current_derived_state, network_info) = {
             let dungeon_states_lock = state.dungeon_states.read().await;
-            dungeon_states_lock.contains_key(&dungeon_config.id)
+            if let Some(dungeon_state) = dungeon_states_lock.get(&dungeon_config.id) {
+                let network_info = if let Some(ref network_state) = dungeon_state.network_state {
+                    serde_json::json!({
+                        "collapse_respawn_timestamp": network_state.collapse_respawn_timestamp,
+                        "is_collapsed": network_state.is_collapsed,
+                        "has_scheduled_collapse": network_state.collapse_respawn_timestamp > 0,
+                    })
+                } else {
+                    serde_json::json!(null)
+                };
+                
+                (true, format!("{:?}", dungeon_state.derived_state).to_lowercase(), network_info)
+            } else {
+                // Default to "open" state for untracked dungeons instead of "unknown"
+                // This provides a better UX than showing all dungeons as unknown
+                (false, "open".to_string(), serde_json::json!(null))
+            }
         };
         
         // Add dungeon state tracking information
         dungeon_info["state_tracking"] = serde_json::json!({
             "enabled": true,
             "active": is_tracked,
-            "lifecycle_states": ["Open", "Cleared", "Closed"],
+            "current_state": current_derived_state,
+            "network_state": network_info,
+            "lifecycle_states": ["open", "cleared", "closed"],
             "network_state_monitoring": "dimension_network_state table",
             "sse_events": "dungeon.* events via /sse/events/dungeons"
         });
@@ -495,7 +532,8 @@ async fn route_dungeons(
                     serde_json::json!({
                         "entity_id": entity_id,
                         "coordinates": [coords[0] as f64 / 1_000f64, coords[1] as f64 / 1_000f64],
-                        "portal_active": true
+                        "portal_active": true,
+                        "current_state": current_derived_state // Add state to each portal
                     })
                 })
                 .collect();
@@ -525,9 +563,99 @@ async fn route_dungeons(
             "tracked_dungeons": tracked_dungeons_count,
             "includes_portal_state": true,
             "includes_dungeon_state_tracking": true,
+            "includes_current_states": true,
             "state_system": "dimension_network_state lifecycle management",
             "sse_endpoint": "/sse/events/dungeons",
-            "derived_states": ["Open", "Cleared", "Closed"]
+            "derived_states": ["open", "cleared", "closed"]
+        }
+    }))
+}
+
+async fn route_dungeons_tracked(
+    state: State<Arc<AppStateWithSse<AppState>>>,
+) -> Json<Value> {
+    // Get only dungeons that are actually tracked in dungeon_states
+    let mut tracked_dungeons = Vec::new();
+    
+    let dungeon_states_lock = state.dungeon_states.read().await;
+    for (entity_id, dungeon_state) in dungeon_states_lock.iter() {
+        // Find the dungeon config for this entity_id
+        if let Some(dungeon_config) = state.app_state.dungeons_list.iter().find(|d| d.id == *entity_id) {
+            let mut dungeon_info = serde_json::json!({
+                "id": dungeon_config.id,
+                "name": dungeon_config.name,
+                "properties": dungeon_config.properties
+            });
+            
+            // Add actual state tracking information (always present since we're iterating dungeon_states)
+            let network_info = if let Some(ref network_state) = dungeon_state.network_state {
+                serde_json::json!({
+                    "collapse_respawn_timestamp": network_state.collapse_respawn_timestamp,
+                    "is_collapsed": network_state.is_collapsed,
+                    "has_scheduled_collapse": network_state.collapse_respawn_timestamp > 0,
+                })
+            } else {
+                serde_json::json!(null)
+            };
+            
+            let current_derived_state = format!("{:?}", dungeon_state.derived_state).to_lowercase();
+            
+            dungeon_info["state_tracking"] = serde_json::json!({
+                "enabled": true,
+                "active": true, // Always true for tracked dungeons
+                "current_state": current_derived_state,
+                "network_state": network_info,
+                "lifecycle_states": ["open", "cleared", "closed"],
+                "network_state_monitoring": "dimension_network_state table",
+                "sse_events": "dungeon.* events via /sse/events/dungeons"
+            });
+            
+            // Check if this dungeon has any active portals
+            if let Some(dungeon_group) = state.app_state.dungeon.get(entity_id) {
+                let nodes = dungeon_group.nodes.read().await;
+                let active_portals: Vec<serde_json::Value> = nodes
+                    .iter()
+                    .map(|(portal_entity_id, coords)| {
+                        serde_json::json!({
+                            "entity_id": portal_entity_id,
+                            "coordinates": [coords[0] as f64 / 1_000f64, coords[1] as f64 / 1_000f64],
+                            "portal_active": true,
+                            "current_state": current_derived_state // Add state to each portal
+                        })
+                    })
+                    .collect();
+                
+                dungeon_info["portal_state"] = serde_json::json!({
+                    "has_active_portals": !active_portals.is_empty(),
+                    "active_portal_count": active_portals.len(),
+                    "active_portals": active_portals
+                });
+            } else {
+                // No dungeon group found, no active portals
+                dungeon_info["portal_state"] = serde_json::json!({
+                    "has_active_portals": false,
+                    "active_portal_count": 0,
+                    "active_portals": []
+                });
+            }
+            
+            tracked_dungeons.push(dungeon_info);
+        }
+    }
+    
+    Json(serde_json::json!({
+        "dungeons": tracked_dungeons,
+        "metadata": {
+            "endpoint": "dungeons/tracked",
+            "total_dungeons": tracked_dungeons.len(),
+            "tracked_dungeons": tracked_dungeons.len(), // Same as total since we only return tracked ones
+            "includes_portal_state": true,
+            "includes_dungeon_state_tracking": true,
+            "includes_current_states": true,
+            "state_system": "dimension_network_state lifecycle management",
+            "sse_endpoint": "/sse/events/dungeons",
+            "derived_states": ["open", "cleared", "closed"],
+            "description": "Returns only dungeons with actual state tracking data"
         }
     }))
 }

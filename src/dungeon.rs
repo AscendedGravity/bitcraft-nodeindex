@@ -43,16 +43,32 @@ impl DimensionNetworkState {
     
     /// Compute the derived state at a specific timestamp (for testing)
     pub fn derived_state_at_time(&self, current_time_ms: u64) -> DerivedState {
+        // Debug logging to understand what values we're working with
+        tracing::debug!("DimensionNetworkState::derived_state_at_time: collapse_timestamp={}, is_collapsed={}, current_time={}", 
+                       self.collapse_respawn_timestamp, self.is_collapsed, current_time_ms);
+        
         // If collapsed, the dungeon is closed regardless of timestamp
         if self.is_collapsed {
+            tracing::debug!("DimensionNetworkState::derived_state_at_time: CLOSED (is_collapsed=true)");
             return DerivedState::Closed;
         }
         
         // If not collapsed, check the collapse timestamp
         match self.collapse_respawn_timestamp {
-            0 => DerivedState::Open, // 0 means no scheduled collapse
-            future_timestamp if future_timestamp > current_time_ms => DerivedState::Cleared, // Scheduled for future collapse
-            _ => DerivedState::Open, // Past timestamp but not collapsed = open (edge case)
+            0 => {
+                tracing::debug!("DimensionNetworkState::derived_state_at_time: OPEN (no scheduled collapse)");
+                DerivedState::Open // 0 means no scheduled collapse
+            },
+            future_timestamp if future_timestamp > current_time_ms => {
+                tracing::debug!("DimensionNetworkState::derived_state_at_time: CLEARED (scheduled for future collapse in {}ms)", 
+                               future_timestamp - current_time_ms);
+                DerivedState::Cleared // Scheduled for future collapse
+            },
+            past_timestamp => {
+                tracing::debug!("DimensionNetworkState::derived_state_at_time: OPEN (past timestamp {}ms ago)", 
+                               current_time_ms - past_timestamp);
+                DerivedState::Open // Past timestamp but not collapsed = open (edge case)
+            }
         }
     }
     
@@ -243,5 +259,88 @@ mod tests {
         let transition = dungeon.clear_network_state();
         assert!(transition.is_some());
         assert_eq!(dungeon.derived_state, DerivedState::Open);
+    }
+
+    #[test]
+    fn test_insert_delete_pattern() {
+        // Test the pattern where insert is followed by immediate delete
+        // This simulates the stabilization logic fix
+        
+        // Simulate pending operations (like in database.rs)
+        struct PendingOperation {
+            network_state: Option<DimensionNetworkState>,
+            timestamp: u64,
+        }
+        
+        let mut operations = Vec::new();
+        
+        // Insert operation (cleared state)
+        let current_time = 1757093840083u64;
+        let future_time = current_time + 300000; // 5 minutes future
+        let network_state = DimensionNetworkState::new(future_time, false);
+        operations.push(PendingOperation {
+            network_state: Some(network_state.clone()),
+            timestamp: current_time,
+        });
+        
+        // Immediate delete operation
+        operations.push(PendingOperation {
+            network_state: None,
+            timestamp: current_time + 1,
+        });
+        
+        // Apply the NEW stabilization logic (preserve inserts)
+        let mut final_state: Option<DimensionNetworkState> = None;
+        let mut has_any_insert = false;
+        
+        for op in &operations {
+            if op.network_state.is_some() {
+                has_any_insert = true;
+                final_state = op.network_state.clone();
+                break; // Take the first insert we find
+            }
+        }
+        
+        // If no inserts found, use None
+        if !has_any_insert {
+            final_state = None;
+        }
+        
+        // With the NEW logic, we should preserve the insert (cleared state)
+        assert!(final_state.is_some());
+        assert_eq!(final_state.unwrap().derived_state_at_time(current_time), DerivedState::Cleared);
+    }
+
+    #[test] 
+    fn test_old_logic_vs_new_logic() {
+        // Test that demonstrates the difference between old and new logic
+        
+        let current_time = 1757093840083u64;
+        let future_time = current_time + 300000; // 5 minutes future
+        let network_state = DimensionNetworkState::new(future_time, false);
+        
+        let operations = vec![
+            (Some(network_state.clone()), current_time),     // Insert
+            (None, current_time + 1),                        // Delete
+        ];
+        
+        // OLD LOGIC (takes last operation)
+        let old_final_state = operations.last().map(|(state, _)| state.clone()).unwrap();
+        
+        // NEW LOGIC (preserves any insert)
+        let mut new_final_state: Option<DimensionNetworkState> = None;
+        for (state, _) in &operations {
+            if state.is_some() {
+                new_final_state = state.clone();
+                break;
+            }
+        }
+        
+        // Old logic would lose the cleared state
+        assert!(old_final_state.is_none());
+        
+        // New logic preserves the cleared state
+        assert!(new_final_state.is_some());
+        assert_eq!(new_final_state.unwrap().derived_state_at_time(current_time), DerivedState::Cleared);
     }
 }
