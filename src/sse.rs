@@ -1,5 +1,8 @@
 use std::time::Duration;
-use tokio::sync::broadcast;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::collections::HashMap;
+use tokio::sync::{broadcast, RwLock};
 use serde::{Serialize, Deserialize};
 use thiserror::Error;
 use axum::{
@@ -9,7 +12,6 @@ use axum::{
     Router,
 };
 use tokio_stream::{wrappers::BroadcastStream, StreamExt, Stream};
-use std::sync::Arc;
 
 use crate::config::ChatMessage;
 
@@ -80,13 +82,18 @@ pub enum SseError {
 pub struct SseManager {
     tx: broadcast::Sender<SseEvent>,
     config: SseConfig,
+    seq_counter: Arc<AtomicU64>,
 }
 
 impl SseManager {
     /// Create a new SSE manager with the given configuration
     pub fn new(config: SseConfig) -> Self {
         let (tx, _) = broadcast::channel(config.channel_capacity);
-        Self { tx, config }
+        Self { 
+            tx, 
+            config,
+            seq_counter: Arc::new(AtomicU64::new(1)), // Start sequence at 1
+        }
     }
     
     /// Create a new SSE manager with default configuration
@@ -94,6 +101,11 @@ impl SseManager {
         Self::new(SseConfig::default())
     }
     
+    /// Get the next sequence number
+    pub fn next_seq(&self) -> u64 {
+        self.seq_counter.fetch_add(1, Ordering::SeqCst)
+    }
+
     /// Subscribe to SSE events
     pub fn subscribe(&self) -> broadcast::Receiver<SseEvent> {
         self.tx.subscribe()
@@ -234,6 +246,121 @@ impl SseManager {
             None => format!("[{}] {}: {}", channel, username, text),
         };
         let event = SseEvent { message: formatted_message, event_type: Some("chat".to_string()) };
+        self.send_event_if_subscribers(event)
+    }
+
+    // === Dungeon-specific SSE events ===
+
+    /// Send a dungeon snapshot event (for initial client synchronization)
+    pub fn send_dungeon_snapshot(&self, entity_id: u64, dungeon_data: &serde_json::Value, network_state: Option<&serde_json::Value>, derived_state: &str) -> Result<bool, SseError> {
+        let seq = self.next_seq();
+        let mut event_data = serde_json::json!({
+            "type": "dungeon.snapshot",
+            "entity_id": entity_id,
+            "dungeon": dungeon_data,
+            "derived_state": derived_state,
+            "seq": seq,
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        });
+        
+        if let Some(network) = network_state {
+            event_data["network"] = network.clone();
+        }
+        
+        let event = SseEvent { 
+            message: event_data.to_string(), 
+            event_type: Some("dungeon.snapshot".to_string()) 
+        };
+        self.send_event_if_subscribers(event)
+    }
+
+    /// Send a dungeon created event
+    pub fn send_dungeon_created(&self, entity_id: u64, dungeon_data: &serde_json::Value) -> Result<bool, SseError> {
+        let seq = self.next_seq();
+        let event_data = serde_json::json!({
+            "type": "dungeon.created",
+            "entity_id": entity_id,
+            "dungeon": dungeon_data,
+            "seq": seq,
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        });
+        
+        let event = SseEvent { 
+            message: event_data.to_string(), 
+            event_type: Some("dungeon.created".to_string()) 
+        };
+        self.send_event_if_subscribers(event)
+    }
+
+    /// Send a dungeon updated event
+    pub fn send_dungeon_updated(&self, entity_id: u64, dungeon_data: &serde_json::Value) -> Result<bool, SseError> {
+        let seq = self.next_seq();
+        let event_data = serde_json::json!({
+            "type": "dungeon.updated",
+            "entity_id": entity_id,
+            "dungeon": dungeon_data,
+            "seq": seq,
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        });
+        
+        let event = SseEvent { 
+            message: event_data.to_string(), 
+            event_type: Some("dungeon.updated".to_string()) 
+        };
+        self.send_event_if_subscribers(event)
+    }
+
+    /// Send a dungeon network updated event (collapse lifecycle changes)
+    pub fn send_dungeon_network_updated(&self, entity_id: u64, network_state: &serde_json::Value, derived_state: &str) -> Result<bool, SseError> {
+        let seq = self.next_seq();
+        let event_data = serde_json::json!({
+            "type": "dungeon.network.updated",
+            "entity_id": entity_id,
+            "network": network_state,
+            "derived_state": derived_state,
+            "seq": seq,
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        });
+        
+        let event = SseEvent { 
+            message: event_data.to_string(), 
+            event_type: Some("dungeon.network.updated".to_string()) 
+        };
+        self.send_event_if_subscribers(event)
+    }
+
+    /// Send a dungeon network transition event (state change from/to)
+    pub fn send_dungeon_network_transition(&self, entity_id: u64, from_state: &str, to_state: &str, at_timestamp: u64) -> Result<bool, SseError> {
+        let seq = self.next_seq();
+        let event_data = serde_json::json!({
+            "type": "dungeon.network.transition",
+            "entity_id": entity_id,
+            "from": from_state,
+            "to": to_state,
+            "at_ts": at_timestamp,
+            "seq": seq,
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        });
+        
+        let event = SseEvent { 
+            message: event_data.to_string(), 
+            event_type: Some("dungeon.network.transition".to_string()) 
+        };
         self.send_event_if_subscribers(event)
     }
 }
@@ -450,6 +577,76 @@ impl SseMessageProcessor {
             }
         }
     }
+
+    // === Dungeon-specific processor methods ===
+
+    /// Process a dungeon created event and send appropriate SSE event
+    pub fn process_dungeon_created(&self, entity_id: u64, dungeon_data: &serde_json::Value) -> Result<(), SseError> {
+        match self.manager.send_dungeon_created(entity_id, dungeon_data) {
+            Ok(true) => {
+                if self.manager.config.verbose_logging {
+                    println!("SSE: Dungeon created event sent for entity {}", entity_id);
+                }
+                Ok(())
+            }
+            Ok(false) => Ok(()),
+            Err(e) => {
+                self.manager.log_error("dungeon created", &e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Process a dungeon updated event and send appropriate SSE event
+    pub fn process_dungeon_updated(&self, entity_id: u64, dungeon_data: &serde_json::Value) -> Result<(), SseError> {
+        match self.manager.send_dungeon_updated(entity_id, dungeon_data) {
+            Ok(true) => {
+                if self.manager.config.verbose_logging {
+                    println!("SSE: Dungeon updated event sent for entity {}", entity_id);
+                }
+                Ok(())
+            }
+            Ok(false) => Ok(()),
+            Err(e) => {
+                self.manager.log_error("dungeon updated", &e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Process a dungeon network updated event and send appropriate SSE event
+    pub fn process_dungeon_network_updated(&self, entity_id: u64, network_state: &serde_json::Value, derived_state: &str) -> Result<(), SseError> {
+        match self.manager.send_dungeon_network_updated(entity_id, network_state, derived_state) {
+            Ok(true) => {
+                if self.manager.config.verbose_logging {
+                    println!("SSE: Dungeon network updated event sent for entity {} (state: {})", entity_id, derived_state);
+                }
+                Ok(())
+            }
+            Ok(false) => Ok(()),
+            Err(e) => {
+                self.manager.log_error("dungeon network updated", &e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Process a dungeon network transition event and send appropriate SSE event
+    pub fn process_dungeon_network_transition(&self, entity_id: u64, from_state: &str, to_state: &str, at_timestamp: u64) -> Result<(), SseError> {
+        match self.manager.send_dungeon_network_transition(entity_id, from_state, to_state, at_timestamp) {
+            Ok(true) => {
+                if self.manager.config.verbose_logging {
+                    println!("SSE: Dungeon network transition event sent for entity {} ({} -> {})", entity_id, from_state, to_state);
+                }
+                Ok(())
+            }
+            Ok(false) => Ok(()),
+            Err(e) => {
+                self.manager.log_error("dungeon network transition", &e);
+                Err(e)
+            }
+        }
+    }
 }
 
 // === HTTP Route Integration ===
@@ -458,6 +655,7 @@ impl SseMessageProcessor {
 pub struct AppStateWithSse<T> {
     pub app_state: Arc<T>,
     pub sse_manager: SseManager,
+    pub dungeon_states: Arc<RwLock<HashMap<u64, crate::dungeon::DungeonState>>>,
 }
 
 /// SSE route handler function
@@ -500,10 +698,10 @@ async fn route_sse_dungeons<T>(
         .filter(|msg| {
             match msg {
                 Ok(sse_event) => {
-                    // Filter to only dungeon-related and portal state change events
+                    // Filter to dungeon-related events (including new dungeon.* event types)
                     let is_dungeon_event = sse_event.message.starts_with("dungeon_insert:") || 
                                          sse_event.message.starts_with("dungeon_delete:") ||
-                                         sse_event.event_type.as_deref() == Some("dungeon_portal") ||
+                                         sse_event.event_type.as_deref().map(|t| t.starts_with("dungeon.")).unwrap_or(false) ||
                                          sse_event.event_type.as_deref() == Some("portal_state_change");
                     is_dungeon_event
                 }

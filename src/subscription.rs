@@ -44,10 +44,10 @@ impl Query {
                 "SELECT * FROM empire_state;".to_string(),
             ],
             Query::DUNGEONS => vec![
-                // Portal states - subscribe to all portal_state entries to track enabled/disabled changes
-                "SELECT * FROM portal_state;".to_string(),
-                // Location data for portal positions  
-                "SELECT loc.* FROM location_state loc JOIN portal_state ps ON loc.entity_id = ps.entity_id;".to_string(),
+                // Primary dungeon query - subscribe to all dungeon_state entries (canonical entities)
+                "SELECT d.* FROM dungeon_state d;".to_string(),
+                // Network state query - dimension lifecycle tracking joined to dungeons
+                "SELECT n.* FROM dimension_network_state n JOIN dungeon_state d ON n.building_id = d.entity_id;".to_string(),
             ],
         }
     }

@@ -5,6 +5,7 @@ use hashbrown::{HashMap, HashSet};
 use tokio::sync::mpsc::UnboundedReceiver;
 use crate::config::{AppState, ChatMessage};
 use crate::sse::{SseManager, SseMessageProcessor};
+use crate::dungeon::{DimensionNetworkState, DungeonState};
 
 struct Update {
     insert: HashMap<u64, [i32; 2]>,
@@ -31,6 +32,9 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
     let mut enemy_state = HashMap::new();
     // player tracking for entity ID mapping (signed-in players)
     let mut player_entity_map: HashMap<u64, u64> = HashMap::new();
+    
+    // Dungeon state tracking: entity_id -> DungeonState
+    let mut dungeon_states: HashMap<u64, DungeonState> = HashMap::new();
     
     // Event buffering system for handling race conditions
     #[derive(Debug, Clone)]
@@ -186,6 +190,155 @@ pub async fn consume_with_sse(mut rx: UnboundedReceiver<DbUpdate>, state: Arc<Ap
             map.reserve(updates.additional());
             for e_id in updates.delete { map.remove(&e_id); }
             for (e_id, loc) in updates.insert { map.insert(e_id, loc); }
+        }
+
+        // === DUNGEON STATE PROCESSING ===
+        // Process dungeon_state updates first (primary entities)
+        for e in update.dungeon_state.inserts {
+            let entity_id = e.row.entity_id;
+            tracing::debug!("dungeon_state.insert: Processing dungeon entity_id={}", entity_id);
+            
+            // Check if this is a configured dungeon
+            if let Some(_dungeon_config) = state.dungeons_list.iter().find(|d| d.id == entity_id) {
+                // Create a minimal JSON representation with the fields we need
+                let dungeon_row = serde_json::json!({
+                    "entity_id": entity_id,
+                    // Add other fields from e.row as needed
+                });
+                
+                // Create or update dungeon state
+                let dungeon_state = dungeon_states.entry(entity_id)
+                    .or_insert_with(|| DungeonState::new(entity_id, dungeon_row.clone()));
+                
+                if dungeon_state.dungeon_row.is_none() {
+                    dungeon_state.dungeon_row = Some(dungeon_row.clone());
+                    tracing::info!("dungeon_state.insert: NEW DUNGEON entity_id={}", entity_id);
+                    
+                    // Send dungeon.created SSE event
+                    let _ = sse_processor.process_dungeon_created(entity_id, &dungeon_row);
+                } else {
+                    dungeon_state.dungeon_row = Some(dungeon_row.clone());
+                    tracing::debug!("dungeon_state.insert: UPDATED DUNGEON entity_id={}", entity_id);
+                    
+                    // Send dungeon.updated SSE event
+                    let _ = sse_processor.process_dungeon_updated(entity_id, &dungeon_row);
+                }
+                
+                // Add to in-memory tracking if configured
+                if let Some(dungeon_group) = state.dungeon.get(&entity_id) {
+                    let mut nodes = dungeon_group.nodes.write().await;
+                    // For dungeon_state, we don't have coordinates directly - they come from location joins
+                    // For now, just ensure the entity is tracked
+                    if !nodes.contains_key(&entity_id) {
+                        nodes.insert(entity_id, [0, 0]); // Placeholder until location data arrives
+                    }
+                }
+            } else {
+                tracing::debug!("dungeon_state.insert: Dungeon entity_id={} not in config", entity_id);
+            }
+        }
+        
+        for e in update.dungeon_state.deletes {
+            let entity_id = e.row.entity_id;
+            tracing::info!("dungeon_state.delete: REMOVING DUNGEON entity_id={}", entity_id);
+            
+            // Remove from state tracking
+            dungeon_states.remove(&entity_id);
+            
+            // Remove from in-memory tracking
+            if let Some(dungeon_group) = state.dungeon.get(&entity_id) {
+                let mut nodes = dungeon_group.nodes.write().await;
+                nodes.remove(&entity_id);
+            }
+            
+            // Send dungeon.deleted SSE event (reuse existing dungeon_delete for now)
+            let _ = sse_processor.process_dungeon_delete(entity_id, entity_id);
+        }
+        
+        // Process dimension_network_state updates (network lifecycle)
+        for e in update.dimension_network_state.inserts {
+            let building_id = e.row.building_id;
+            tracing::debug!("dimension_network_state.insert: Processing building_id={} collapse_timestamp={} is_collapsed={}", 
+                           building_id, e.row.collapse_respawn_timestamp, e.row.is_collapsed);
+            
+            // Check if this relates to a tracked dungeon
+            if let Some(dungeon_state) = dungeon_states.get_mut(&building_id) {
+                let _old_derived_state = dungeon_state.derived_state.clone();
+                
+                // Create new network state
+                let network_state = DimensionNetworkState::new(
+                    e.row.collapse_respawn_timestamp,
+                    e.row.is_collapsed
+                );
+                
+                // Create network state JSON for SSE
+                let network_json = serde_json::json!({
+                    "collapse_respawn_timestamp": e.row.collapse_respawn_timestamp,
+                    "is_collapsed": e.row.is_collapsed
+                });
+                
+                // Update dungeon state and check for transitions
+                if let Some(transition) = dungeon_state.update_network_state(network_state.clone()) {
+                    tracing::info!("dimension_network_state.insert: STATE TRANSITION building_id={} {:?} -> {:?}", 
+                                 building_id, transition.from, transition.to);
+                    
+                    // Send transition SSE event
+                    let _ = sse_processor.process_dungeon_network_transition(
+                        building_id, 
+                        &format!("{:?}", transition.from).to_lowercase(), 
+                        &format!("{:?}", transition.to).to_lowercase(), 
+                        transition.at_timestamp
+                    );
+                    
+                    // Send network updated SSE event with derived_state
+                    let _ = sse_processor.process_dungeon_network_updated(
+                        building_id, 
+                        &network_json, 
+                        &format!("{:?}", dungeon_state.derived_state).to_lowercase()
+                    );
+                } else {
+                    tracing::debug!("dimension_network_state.insert: NO STATE CHANGE building_id={} state={:?}", 
+                                  building_id, dungeon_state.derived_state);
+                    
+                    // Send network updated SSE event (no transition but network data changed)
+                    let _ = sse_processor.process_dungeon_network_updated(
+                        building_id, 
+                        &network_json, 
+                        &format!("{:?}", dungeon_state.derived_state).to_lowercase()
+                    );
+                }
+            } else {
+                tracing::debug!("dimension_network_state.insert: No dungeon state found for building_id={}", building_id);
+            }
+        }
+        
+        for e in update.dimension_network_state.deletes {
+            let building_id = e.row.building_id;
+            tracing::info!("dimension_network_state.delete: REMOVING NETWORK STATE building_id={}", building_id);
+            
+            // Check if this relates to a tracked dungeon
+            if let Some(dungeon_state) = dungeon_states.get_mut(&building_id) {
+                if let Some(transition) = dungeon_state.clear_network_state() {
+                    tracing::info!("dimension_network_state.delete: STATE TRANSITION building_id={} {:?} -> {:?}", 
+                                 building_id, transition.from, transition.to);
+                    
+                    // Send transition SSE event
+                    let _ = sse_processor.process_dungeon_network_transition(
+                        building_id, 
+                        &format!("{:?}", transition.from).to_lowercase(), 
+                        &format!("{:?}", transition.to).to_lowercase(), 
+                        transition.at_timestamp
+                    );
+                    
+                    // Send network updated SSE event (cleared network state)
+                    let empty_network = serde_json::json!(null);
+                    let _ = sse_processor.process_dungeon_network_updated(
+                        building_id, 
+                        &empty_network, 
+                        &format!("{:?}", dungeon_state.derived_state).to_lowercase()
+                    );
+                }
+            }
         }
 
         // Process portal state updates for dungeons tracking
